@@ -1,4 +1,8 @@
-# Arkfile
+# Arkfile [Archived]
+
+**SEE: https://github.com/arkfile/Arkfile for continuing development of this project.**
+
+---
 
 *Private File Vault over S3*
 
