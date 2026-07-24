@@ -2,6 +2,29 @@
  * UI section management utilities
  */
 
+/** Absolute-positioned nav dropdown panels that must be mutually exclusive. */
+export const NAV_INLINE_PANEL_IDS = [
+  'security-settings',
+  'contact-info-panel',
+  'billing-panel',
+  'verify-file-panel',
+  'download-integrity-panel',
+] as const;
+
+/**
+ * Hide all nav inline panels except the given id (or hide all when keep is omitted).
+ * Prevents stacked .security-panel overlays from intercepting clicks.
+ */
+export function closeNavInlinePanelsExcept(keep?: string): void {
+  for (const id of NAV_INLINE_PANEL_IDS) {
+    if (keep !== undefined && id === keep) continue;
+    const el = document.getElementById(id);
+    if (el && !el.classList.contains('hidden')) {
+      el.classList.add('hidden');
+    }
+  }
+}
+
 export function showFileSection(): void {
   const authSection = document.getElementById('auth-section');
   const fileSection = document.getElementById('file-section');
@@ -117,25 +140,13 @@ export function showTOTPSetupSection(predefinedData?: any): void {
   }
 }
 
-export function hideTOTPSetupSection(): void {
-  const totpSetupForm = document.getElementById('totp-setup-form');
-  const loginForm = document.getElementById('login-form');
-  
-  if (totpSetupForm) {
-    totpSetupForm.classList.add('hidden');
-  }
-  
-  if (loginForm) {
-    loginForm.classList.remove('hidden');
-  }
-}
-
 export function toggleSecuritySettings(): void {
   const securityPanel = document.getElementById('security-settings');
   if (securityPanel) {
     const opening = securityPanel.classList.contains('hidden');
     securityPanel.classList.toggle('hidden');
     if (opening) {
+      closeNavInlinePanelsExcept('security-settings');
       void import('../auth/mfa-settings.js').then(({ loadMFASettingsPanel }) => loadMFASettingsPanel());
     }
   }
@@ -171,9 +182,9 @@ export function showPendingApprovalSection(): void {
 
   // Fetch admin contact info and display it for the pending user (best-effort)
   import('../utils/auth.js').then(({ fetchAdminContacts }) => {
-    fetchAdminContacts().then(({ contact }) => {
+    fetchAdminContacts().then(({ contact, configured }) => {
       const el = document.getElementById('pending-admin-contact-display');
-      if (el && contact && contact !== 'admin@example.com') {
+      if (el && configured && contact) {
         el.textContent = ` You can reach the admin at: ${contact}`;
       }
     }).catch(() => {});
@@ -185,15 +196,3 @@ export function showPendingApprovalSection(): void {
   }).catch(() => {});
 }
 
-export function hidePendingApprovalSection(): void {
-  const pendingApprovalSection = document.getElementById('pending-approval-section');
-  const loginForm = document.getElementById('login-form');
-  
-  if (pendingApprovalSection) {
-    pendingApprovalSection.classList.add('hidden');
-  }
-  
-  if (loginForm) {
-    loginForm.classList.remove('hidden');
-  }
-}

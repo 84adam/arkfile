@@ -10,17 +10,19 @@ We use OPAQUE for authentication, so that passwords are never sent to the server
 
 We use client-side encryption to ensure that file data is never sent to the server until and unless it is encrypted with a strong password.
 
-We use client-side encryption to encrypt file metadata as well, including the original filename, size and the original sha256 digest of the original file.
+We use client-side encryption to encrypt owner file metadata as well, including the original filename, the original SHA-256 digest of the plaintext file, and (when present) the custom-password hint. Those fields reach the server only as opaque ciphertext and nonces.
 
 We never log IP addresses or any PII of users or visitors to the app/site. (e.g. Visitor IP addresses are not logged and are obfuscated with HMAC to form an EntityID for select areas that need rate-limiting, such as to protect against shared file URL enumeration type attacks.)
 
-The server must know nothing about the nature of the data belonging to clients, nor about their passwords, nor visitor IPs.
+The server must never learn user passwords, plaintext file contents, plaintext filenames, plaintext content digests, or plaintext password hints. The server does intentionally know operational metadata required for storage accounting and billing: pre-padding encrypted stream length (`size_bytes` / upload `total_size`), padded object size, chunk counts and plaintext chunk size, ownership username, and routing fields such as `password_type` and the FEK envelope key-type byte. Padding obscures size from storage backends and outside observers of objects, not from the Arkfile server that receives the declared encrypted length at upload init. See `docs/security.md` for the full classification.
 
 When users (file owners) choose to share files with others (anonymous recipients), they encrypt information about the file along with a file download token and a file encryption key all wrapped up into a share envelope that is uploaded to the server in encrypted form, so that again the server learns nothing of the files or their contents. Anonymous recipients of shared files need only the Share URL and Share Password in order access the share envelope, decrypt metadata about the file, and download and decrypt it client-side. The file sharing aspect of Arkfile does not require or collect any identifying information about the recipients (no account required to access shared files).
 
 ## Greenfield App
 
 There are no production deployments of this app anywhere at present. For the most part, "backwards compatibility" is not needed at this stage when refactoring. The focus for now is on fixing and proving the correct implementation of the system as it is designed and intended. Be wary and flag it to the developers anytime you come across deprecated/disabled/stub/bad/backwards-compatibility functions or comments, or any technical debt that could make it harder to work with this codebase in the future. There is a test/demo server currently at `test.arkfile.net` with early beta testers using it.
+
+We are aiming to solidy the app now for our first production deployment.
 
 ## Function Review Sanity Checks
 
@@ -40,7 +42,7 @@ In order to slowly build up the core functionality of the system and prove its c
 
 - `sudo bash scripts/dev-reset.sh` - Destructive development iteration tool. Performs a full recompilation of the app (including static-linking of OPAQUE Auth libraries), nukes all data/keys/database, redeploys the app and starts all services. Enables debug mode, WASM trace logging, dev-admin auto-seeding, and the dev/test API. Use this when doing code changes and running e2e tests. Do not attempt to rebuild the app using any other build scripts or manual compilation commands, including for the CLI utils written in Go. If attempting to recompile typescript assets, use `bun` or `bunx` instead of `npm`/`pnpm`/`npx`/etc.
 
-- `sudo bash scripts/local-deploy.sh --admin-username <name>` - Constructive local/LAN deployment tool. Performs a full recompilation and deploys a usable Arkfile instance with production-like settings: admin bootstrap flow (no hardcoded dev credentials), no WASM trace logging, debug mode off, dev/test API disabled. Use this when deploying a real instance on a local machine or LAN. See `docs/wip/local-deploy.md` for the full design document.
+- `sudo bash scripts/local-deploy.sh --admin-username <name>` - Constructive local/LAN deployment tool. Performs a full recompilation and deploys a usable Arkfile instance with production-like settings: admin bootstrap flow (no hardcoded dev credentials), no WASM trace logging, debug mode off, dev/test API disabled. Use this when deploying a real instance on a local machine or LAN.
 
 - `sudo bash scripts/prod-deploy.sh --domain <domain> --desec-token <token> --admin-username <name>` - Production VPS deployment tool. First-time deployment for a real domain with Caddy + Let's Encrypt (DNS-01 via deSEC). Uses production-hardened settings: admin bootstrap flow, no debug mode, no dev/test API, no WASM trace logging. Configures firewall, builds Caddy with deSEC DNS module, generates crypto material, and starts all services with health verification. Supports multiple storage backends (local-seaweedfs, wasabi, backblaze, vultr, hetzner, cloudflare-r2, aws-s3, generic-s3). See also: `test-deploy.sh`.
 
@@ -51,6 +53,12 @@ In order to slowly build up the core functionality of the system and prove its c
 - `bash scripts/testing/e2e-test.sh` - This is the main testing script used for proving out the correct implementation and functionality of the system via in-depth, end-to-end testing of all critical app functions using a combination of `curl` and `arkfile-client`. This script is the main way that we demonstrate that the app does what it is designed to do right now. `e2e-test.sh` requires `dev-reset.sh` (it depends on the dev-admin account and `ADMIN_DEV_TEST_API_ENABLED=true`). Always run `dev-reset.sh` after code changes before running this test script.
 
 - `sudo bash scripts/testing/e2e-playwright.sh` - This is a secondary Playwright-based automated browser test script meant to be run after `e2e-test.sh` in order to further validate that the TypeScript frontend code is functioning properly. It performs many of the same kinds of functional tests such as encrypt/upload, download/decrypt, share/receive shared file, export encrypted backup, etc. But it does not parallel exactly all the tests in `e2e-test.sh`. By design it leverages some of the existing users and files set up by `e2e-test.sh`, for example. Use this script in combination with manual testing in the browser to verify the app is functioning as intended.
+
+- `go test ./...` - Go unit tests for the whole module (`auth`, `crypto`, `handlers`, `storage`, `cmd/arkfile-admin`, `cmd/arkfile-client`, `cli/*`, `clictap`, and the rest). These complement `e2e-test.sh` but do not replace it. Most packages link libopaque via CGO; CLI and `clictap` packages also need vendored libfido2. A bare `go test ./...` without the same CGO environment as `scripts/setup/build.sh` will fail (for example with a missing `fido.h`). Vendored C libraries must exist under `/var/tmp/arkfile-build` (or `$ARKFILE_BUILD_DIR`); run `dev-reset.sh` or `scripts/setup/build.sh` at least once on the machine before the first unit test run. From the repo root, with no `sudo`:
+
+  `source scripts/setup/build-config.sh && export CGO_ENABLED=1 CGO_CFLAGS="$(cli_fido_cgo_cflags)" CGO_LDFLAGS="$(cli_fido_cgo_ldflags "$PWD")" && go test ./...`
+
+  Use the CLI FIDO CGO flags for the full tree: they include the OPAQUE include/library paths used by server-side packages. The run takes several minutes. Packages with no `_test.go` files report `[no test files]` and are expected. Optional flags: `-count=1` to disable the test cache, `-timeout=120s` if a slow package hits the default deadline. AI agents may run this command directly when validating Go changes; unlike `dev-reset.sh`, it does not rebuild or redeploy the app.
 
 - `sudo fdre2e.sh` is strictly for developers to run manually on local dev test machines. Never invoke or attempt to request to run this command yourself as an AI coding agent! This script runs, in sequence, `dev-reset.sh` + `e2e-test.sh` + `e2e-playwright.sh`.
 
@@ -109,6 +117,24 @@ Do not name functions or variables or include in comments references to temporar
 ## Document Formatting
 
 Do not add unnecessary hard line breaks within paragraphs. Allow continuous lines of arbitrary length and allow IDEs and text editors to do the line-wrapping as desired by the end-user, reader or developer.
+
+## Representative Users and Threat Models
+
+When designing features, weigh these personas from low to high adversary pressure. Each assumes client-side crypto is intact and the user chooses strong passwords; none assume protection against a malicious operator serving tampered JavaScript or a user forced to disclose passwords.
+
+**Personal vault (low).** Wants encrypted off-device backup; threats are cloud breach and device loss; needs reliable streaming upload/download and `.arkbackup` export.
+
+**Professional archive (medium).** Needs encrypted metadata, MFA, revocable shares with expiry/download limits; threats include storage subpoena and curious admins.
+
+**Cross-border records (medium).** Minimize identity (username-only, optional email); may use Tor with TOTP; threats include device loss and jurisdiction mismatch; large files on constrained mobile RAM must work.
+
+**Insider preservation and disclosure (high).** Compartmentalization via custom file passwords; selective share without recipient accounts; threats include employer monitoring and coerced account access. Custom passwords limit blast radius.
+
+**Self-hosted operator (medium–high).** Open deploy, S3 backend choice, admin cannot decrypt; threats include misconfiguration and user demand for auditable E2EE.
+
+**Anonymous share recipient (medium–high).** Public share path with no auth; rate limiting via entity ID not raw IP logging; chunked decrypt on low-RAM devices; threats include link enumeration and wrong-channel password delivery.
+
+If a change helps one persona but harms streaming on a 3 GB RAM phone or weakens zero-knowledge guarantees, flag it before shipping.
 
 ## User FAQ (docs/user-faq.md)
 

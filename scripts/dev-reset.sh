@@ -60,10 +60,12 @@ NC='\033[0m'
 
 # Configuration
 ARKFILE_DIR="/opt/arkfile"
-USER="arkfile"
-GROUP="arkfile"
+ARKFILE_USER="arkfile"
+ARKFILE_GROUP="arkfile"
 
 # Preserve original user context for Go operations
+# NB: $USER here is the shell login user (the sudo caller), NOT the arkfile
+# service user — deliberately matches the prod/test/local deploy pattern.
 ORIGINAL_USER="${SUDO_USER:-$USER}"
 ORIGINAL_UID="${SUDO_UID:-$(id -u)}"
 ORIGINAL_GID="${SUDO_GID:-$(id -g)}"
@@ -105,46 +107,10 @@ echo
 
 # find_go_binary, fix_go_ownership, run_go_as_user are provided by build-config.sh
 
-# Function to print status messages
-print_status() {
-    local status=$1
-    local message=$2
-    
-    case $status in
-        "INFO")
-            echo -e "  ${BLUE}INFO:${NC} ${message}"
-            ;;
-        "SUCCESS")
-            echo -e "  ${GREEN}SUCCESS:${NC} ${message}"
-            ;;
-        "WARNING")
-            echo -e "  ${YELLOW}WARNING:${NC} ${message}"
-            ;;
-        "ERROR")
-            echo -e "  ${RED}ERROR:${NC} ${message}"
-            ;;
-    esac
-}
-
-# Function to verify no root-owned files exist in /opt/arkfile
-verify_ownership() {
-    local check_dir="$1"
-    print_status "INFO" "Verifying directory ownership for $check_dir..."
-    
-    # Find any root-owned files/directories
-    local root_owned=$(find "$check_dir" -user root 2>/dev/null | grep -v "^$" || true)
-    
-    if [ -n "$root_owned" ]; then
-        print_status "ERROR" "Found root-owned files/directories:"
-        echo "$root_owned" | while read -r file; do
-            echo "  - $file"
-        done
-        return 1
-    fi
-    
-    print_status "SUCCESS" "All files in $check_dir owned by arkfile user"
-    return 0
-}
+# Shared helpers (print_status, run_as_user, stop_service_*, verify_ownership,
+# validate_username, validate_storage_backend, read_secrets_env_value).
+# Color vars above and ARKFILE_DIR must be set before this is sourced.
+source "$SCRIPT_DIR/setup/deploy-common.sh"
 
 # Find and verify Go binary before proceeding
 echo -e "${YELLOW}Detecting Go installation...${NC}"
@@ -158,18 +124,11 @@ fi
 echo -e "${GREEN}[OK] Found Go at: $GO_BINARY${NC}"
 export GO_BINARY="$GO_BINARY"
 
-# Function to run commands as original user (not root)
-run_as_user() {
-    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" -H "$@"
-    else
-        "$@"
-    fi
-}
-
+# run_as_user is provided by deploy-common.sh.
 # run_go_as_user is provided by build-config.sh
 
-# Verbose wrapper around shared fix_go_ownership (adds print_status messages)
+# Verbose wrapper around shared fix_go_ownership (adds print_status messages).
+# Kept local because it also chowns vendor_c/, which the shared helper does not.
 fix_go_ownership() {
     if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
         print_status "INFO" "Fixing Go file ownership for user $SUDO_USER..."
@@ -182,21 +141,7 @@ fix_go_ownership() {
     fi
 }
 
-# Function to safely stop a service if it exists and is running
-stop_service_if_running() {
-    local service_name="$1"
-    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        print_status "INFO" "Stopping $service_name..."
-        systemctl stop "$service_name" || {
-            print_status "WARNING" "Failed to stop $service_name gracefully, trying force stop..."
-            systemctl kill "$service_name" 2>/dev/null || true
-            sleep 2
-        }
-        print_status "SUCCESS" "$service_name stopped"
-    else
-        print_status "INFO" "$service_name not running"
-    fi
-}
+# stop_service_if_running is provided by deploy-common.sh.
 
 # Step 1: Aggressive service shutdown
 echo -e "${CYAN}Step 1: Stopping all services aggressively${NC}"
@@ -444,7 +389,7 @@ print_status "SUCCESS" "Directory ownership verified"
 # Explicitly create and permission the log directory
 print_status "INFO" "Ensuring log directory exists and has correct permissions..."
 mkdir -p "$ARKFILE_DIR/var/log"
-chown "$USER:$GROUP" "$ARKFILE_DIR/var/log"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/var/log"
 chmod 775 "$ARKFILE_DIR/var/log"
 print_status "SUCCESS" "Log directory configured at $ARKFILE_DIR/var/log"
 echo
@@ -474,6 +419,8 @@ RQLITE_USERNAME=dev-user
 RQLITE_PASSWORD=${RQLITE_PASSWORD}
 
 # Arkfile Application Configuration
+ARKFILE_ENV=development
+BASE_URL=https://localhost:8443
 PORT=8080
 CORS_ALLOWED_ORIGINS=https://localhost:8443
 
@@ -524,6 +471,7 @@ ARKFILE_FREE_STORAGE_BYTES=10485760
 ARKFILE_BILLING_TICK_INTERVAL=1m
 ARKFILE_BILLING_SWEEP_AT_UTC=00:15
 ARKFILE_BILLING_INCLUDE_ADMINS=false
+ARKFILE_PAYG_NEGATIVE_BALANCE_LIMIT_USD=10.00
 
 # Payments integration
 ARKFILE_PAYMENTS_ENABLED=true
@@ -534,6 +482,18 @@ ARKFILE_BTCPAY_WEBHOOK_SECRET=test_webhook_secret
 ARKFILE_MIN_TOP_UP_USD=0.50
 ARKFILE_MAX_TOP_UP_USD=1000.00
 
+# Subscriptions (Subscription Bridge consumer; mock bridge in e2e)
+ARKFILE_SUBSCRIPTIONS_ENABLED=true
+ARKFILE_SUBSCRIPTION_BRIDGE_ENABLED=true
+ARKFILE_BILLING_PAYG_ENABLED=true
+ARKFILE_SUBSCRIPTION_BRIDGE_URL=http://127.0.0.1:8081
+ARKFILE_SUBSCRIPTION_BRIDGE_PAIRING_ROOT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+ARKFILE_SUBSCRIPTION_RETURN_URL=https://localhost:8443/?subscription=return
+ARKFILE_GIFT_SUBSCRIPTION_DEFAULT_DAYS=30
+ARKFILE_GIFT_SUBSCRIPTION_MAX_DAYS=90
+ARKFILE_SUBSCRIPTION_PAST_DUE_GRACE_DAYS=7
+ARKFILE_SUBSCRIPTION_SEED_DEV_PLAN=true
+
 # Development Settings
 REQUIRE_APPROVAL=true
 ENABLE_REGISTRATION=true
@@ -541,7 +501,7 @@ DEBUG_MODE=true
 LOG_LEVEL=debug
 EOF
 
-chown "$USER:$GROUP" "$ARKFILE_DIR/etc/secrets.env"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/secrets.env"
 chmod 640 "$ARKFILE_DIR/etc/secrets.env"
 print_status "SUCCESS" "Fresh configuration created"
 
@@ -570,7 +530,7 @@ cat > "$ARKFILE_DIR/etc/seaweedfs-s3.json" << EOF
 }
 EOF
 
-chown "$USER:$GROUP" "$ARKFILE_DIR/etc/seaweedfs-s3.json"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/seaweedfs-s3.json"
 chmod 640 "$ARKFILE_DIR/etc/seaweedfs-s3.json"
 print_status "SUCCESS" "SeaweedFS S3 auth configuration created"
 
@@ -586,7 +546,7 @@ cat > "$ARKFILE_DIR/etc/rqlite-auth.json" << EOF
 ]
 EOF
 
-chown "$USER:$GROUP" "$ARKFILE_DIR/etc/rqlite-auth.json"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/rqlite-auth.json"
 chmod 640 "$ARKFILE_DIR/etc/rqlite-auth.json"
 print_status "SUCCESS" "Fresh rqlite authentication created"
 

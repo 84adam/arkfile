@@ -21,23 +21,17 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 ARKFILE_DIR="/opt/arkfile"
-USER="arkfile"
-GROUP="arkfile"
+ARKFILE_USER="arkfile"
+ARKFILE_GROUP="arkfile"
 SECRETS_ENV="$ARKFILE_DIR/etc/secrets.env"
 TLS_PORT="8443"
 
 FORCE_REBUILD_ALL=false
 
-print_status() {
-    local status="$1"
-    local message="$2"
-    case "$status" in
-        "INFO")    echo -e "  ${BLUE}INFO:${NC} ${message}" ;;
-        "SUCCESS") echo -e "  ${GREEN}SUCCESS:${NC} ${message}" ;;
-        "WARNING") echo -e "  ${YELLOW}WARNING:${NC} ${message}" ;;
-        "ERROR")   echo -e "  ${RED}ERROR:${NC} ${message}" ;;
-    esac
-}
+# Shared helpers (print_status, run_as_user, stop_service_*, verify_ownership,
+# validate_username, validate_storage_backend, read_secrets_env_value).
+# Color vars above and SECRETS_ENV must be set before this is sourced.
+source "$SCRIPT_DIR/setup/deploy-common.sh"
 
 show_help() {
     cat << EOF2
@@ -60,34 +54,6 @@ Requirements:
   - /opt/arkfile/etc/secrets.env must exist
   - The repo must be checked out at the current working directory
 EOF2
-}
-
-run_as_user() {
-    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" -H "$@"
-    else
-        "$@"
-    fi
-}
-
-stop_service_gracefully() {
-    local service_name="$1"
-    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        print_status "INFO" "Stopping $service_name..."
-        systemctl stop "$service_name" || {
-            print_status "WARNING" "Graceful stop failed for $service_name, trying kill..."
-            systemctl kill "$service_name" 2>/dev/null || true
-            sleep 2
-        }
-        print_status "SUCCESS" "$service_name stopped"
-    else
-        print_status "INFO" "$service_name is not running"
-    fi
-}
-
-read_secrets_env_value() {
-    local key="$1"
-    grep "^${key}=" "$SECRETS_ENV" 2>/dev/null | head -1 | cut -d'=' -f2-
 }
 
 while [[ $# -gt 0 ]]; do
@@ -132,6 +98,17 @@ fi
 TLS_PORT_VALUE=$(read_secrets_env_value "TLS_PORT")
 if [ -n "$TLS_PORT_VALUE" ]; then
     TLS_PORT="$TLS_PORT_VALUE"
+fi
+
+# ARKFILE_DOMAIN binds the OPAQUE server identity (idS); it is REQUIRED.
+# Update scripts assume a complete secrets.env and hard-fail if it is missing
+# rather than silently backfilling (which could change idS out from under
+# existing user records).
+ARKFILE_DOMAIN_VALUE=$(read_secrets_env_value "ARKFILE_DOMAIN")
+if [ -z "$ARKFILE_DOMAIN_VALUE" ]; then
+    print_status "ERROR" "ARKFILE_DOMAIN is not set in $SECRETS_ENV"
+    print_status "ERROR" "It is required (OPAQUE server identity). Add 'ARKFILE_DOMAIN=localhost' (or your chosen idS) and retry."
+    exit 1
 fi
 
 # Detect storage backends from existing secrets.env
@@ -222,57 +199,17 @@ echo -e "${CYAN}Step 1: Build${NC}"
 
 fix_go_ownership
 
-SKIP_C_LIBS=true
-if [ "$FORCE_REBUILD_ALL" = "true" ]; then
-    print_status "INFO" "--force-rebuild-all: will rebuild C libraries and WASM"
-    SKIP_C_LIBS=false
-    if [ -d "$BUILD_ROOT" ]; then
-        rm -rf "$BUILD_ROOT"
-    fi
-elif c_libs_exist; then
-    print_status "INFO" "Existing C libraries found, skipping C rebuild (use --force-rebuild-all to override)"
-else
-    print_status "WARNING" "C libraries not found, will build them"
-    SKIP_C_LIBS=false
-fi
+decide_skip_c_libs_for_update
 
 # Always do a fresh TypeScript build
-rm -f client/static/js/.buildcache
-rm -rf client/static/js/dist/*
-# Also remove the streaming-download SW build artifact (top-level), so it
-# is regenerated fresh from src/sw-download.ts on every run.
-rm -f client/static/js/sw-download.js client/static/js/sw-download.js.map
-
-# Clean build artifacts (binaries/static only), preserving C libraries if skipping
-if [ -d "$BUILD_ROOT" ]; then
-    if [ "$SKIP_C_LIBS" = "true" ]; then
-        rm -rf "$BUILD_BIN" "$BUILD_CLIENT" "$BUILD_DATABASE" "$BUILD_SYSTEMD" "$BUILD_WEBROOT" 2>/dev/null || true
-        rm -f "$BUILD_ROOT/version.json" 2>/dev/null || true
-    else
-        rm -rf "$BUILD_ROOT"
-    fi
-fi
+clear_frontend_build_caches
+wipe_build_artifacts_preserving_c_libs_if_skipping
 
 # No WASM trace logging for local deployment
 unset LIBOPAQUE_DEFINES
 
-export VERSION="update-$(date +%Y%m%d-%H%M%S)"
-export SKIP_C_LIBS="$SKIP_C_LIBS"
-
-fix_go_ownership
-if ! run_as_user ./scripts/setup/build.sh --build-only; then
-    print_status "ERROR" "Build failed"
-    exit 1
-fi
-fix_go_ownership
-
-# Verify critical build artifacts
-[ -f "$BUILD_BIN/arkfile" ]          || { print_status "ERROR" "arkfile binary missing after build"; exit 1; }
-[ -f "$BUILD_BIN/arkfile-client" ]   || { print_status "ERROR" "arkfile-client binary missing after build"; exit 1; }
-[ -f "$BUILD_BIN/arkfile-admin" ]    || { print_status "ERROR" "arkfile-admin binary missing after build"; exit 1; }
-[ -f "$BUILD_CLIENT/static/js/dist/app.js" ] || { print_status "ERROR" "TypeScript bundle missing after build"; exit 1; }
-[ -f "$BUILD_CLIENT/static/js/libopaque.js" ] || { print_status "ERROR" "libopaque.js missing after build"; exit 1; }
-
+run_application_build "update-$(date +%Y%m%d-%H%M%S)"
+verify_build_tree_artifacts
 print_status "SUCCESS" "Build complete"
 
 echo
@@ -286,33 +223,26 @@ sleep 2
 echo
 echo -e "${CYAN}Step 3: Deploy binaries and static assets${NC}"
 
-print_status "INFO" "Deploying Go binaries..."
-install -m 755 -o "$USER" -g "$GROUP" "$BUILD_BIN/arkfile"        "$ARKFILE_DIR/bin/arkfile"
-install -m 755 -o "$USER" -g "$GROUP" "$BUILD_BIN/arkfile-client" "$ARKFILE_DIR/bin/arkfile-client"
-install -m 755 -o "$USER" -g "$GROUP" "$BUILD_BIN/arkfile-admin"  "$ARKFILE_DIR/bin/arkfile-admin"
-print_status "SUCCESS" "Binaries deployed"
+backup_binaries_before_overwrite "arkfile"
 
-print_status "INFO" "Deploying static assets..."
-cp -r "$BUILD_CLIENT/static/." "$ARKFILE_DIR/client/static/"
-chown -R "$USER:$GROUP" "$ARKFILE_DIR/client"
-print_status "SUCCESS" "Static assets deployed"
+install_binaries_from_build
+sync_static_assets_from_build
 
-print_status "INFO" "Deploying updated systemd service files..."
+print_status "INFO" "Deploying updated systemd service files (fail closed on copy failure)..."
+# Caddy is not used by local deployments (self-signed TLS served by Arkfile directly),
+# so caddy.service is intentionally not copied here.
 if [ -d "$BUILD_ROOT/systemd" ]; then
-    cp "$BUILD_ROOT/systemd/arkfile.service"   /etc/systemd/system/ 2>/dev/null || true
-    cp "$BUILD_ROOT/systemd/rqlite.service"    /etc/systemd/system/ 2>/dev/null || true
-    cp "$BUILD_ROOT/systemd/seaweedfs.service" /etc/systemd/system/ 2>/dev/null || true
+    cp "$BUILD_ROOT/systemd/arkfile.service"   /etc/systemd/system/
+    cp "$BUILD_ROOT/systemd/rqlite.service"    /etc/systemd/system/
+    cp "$BUILD_ROOT/systemd/seaweedfs.service" /etc/systemd/system/
     systemctl daemon-reload
     print_status "SUCCESS" "Systemd services updated"
 else
-    print_status "WARNING" "No systemd directory in build, skipping service file update"
+    print_status "ERROR" "No systemd directory in build, systemd service file update failed"
+    exit 1
 fi
 
-print_status "INFO" "Deploying updated database schema..."
-if [ -d "$BUILD_ROOT/database" ]; then
-    cp -r "$BUILD_ROOT/database/." "$ARKFILE_DIR/database/"
-    chown -R "$USER:$GROUP" "$ARKFILE_DIR/database"
-fi
+sync_database_schema_from_build
 
 echo
 echo -e "${CYAN}Step 4: Restart arkfile${NC}"

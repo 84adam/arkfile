@@ -113,8 +113,11 @@ func TickAllActiveUsers(db *sql.DB, rate *Rate, now time.Time, cfg config.Billin
 			errCount++
 			continue
 		}
+		if !ShouldMeter(db, username) {
+			continue
+		}
 		if tickErr := TickUser(db, username, rate, now, cfg.FreeBaselineBytes); tickErr != nil {
-			logging.ErrorLogger.Printf("billing.TickAllActiveUsers: tick %s: %v", username, tickErr)
+			logging.ErrorLogger.Printf("billing.TickAllActiveUsers: user tick failed: %v", tickErr)
 			errCount++
 			continue
 		}

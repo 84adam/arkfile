@@ -12,6 +12,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/arkfile/Arkfile/auth"
+	"github.com/arkfile/Arkfile/config"
 	"github.com/arkfile/Arkfile/database"
 	"github.com/arkfile/Arkfile/logging"
 	"github.com/arkfile/Arkfile/models"
@@ -60,8 +61,16 @@ func RefreshToken(c echo.Context) error {
 		return JSONError(c, http.StatusUnauthorized, "Invalid or expired refresh token")
 	}
 
-	// Generate new full-tier JWT. Refresh flow always produces a full token; a user
-	// who has not completed TOTP never receives a refresh token in the first place.
+	user, err := models.GetUserByUsername(database.DB, username)
+	if err != nil {
+		logging.ErrorLogger.Printf("Failed to load user for refresh %s: %v", username, err)
+		return JSONError(c, http.StatusInternalServerError, "Failed to refresh token")
+	}
+	if !user.IsApproved && !user.HasAdminPrivileges() {
+		return JSONError(c, http.StatusForbidden, "Account pending approval")
+	}
+
+	// Generate new full-tier JWT.
 	token, expirationTime, err := auth.GenerateFullAccessToken(username)
 	if err != nil {
 		logging.ErrorLogger.Printf("Failed to generate token for %s: %v", username, err)
@@ -199,19 +208,9 @@ func AdminForceLogout(c echo.Context) error {
 		return JSONError(c, http.StatusBadRequest, "Username is required")
 	}
 
-	// Verify admin privileges (this should be handled by AdminMiddleware)
-	// Force revoke all tokens for target user
-	err := models.RevokeAllUserTokens(database.DB, targetUsername)
-	if err != nil {
+	if err := terminateUserSessions(targetUsername, "admin force logout"); err != nil {
 		logging.ErrorLogger.Printf("Admin %s failed to revoke tokens for %s: %v", adminUsername, targetUsername, err)
 		return JSONError(c, http.StatusInternalServerError, "Failed to revoke user tokens")
-	}
-
-	// Add user-specific JWT revocation
-	err = auth.RevokeAllUserJWTTokens(database.DB, targetUsername, "admin force logout")
-	if err != nil {
-		logging.ErrorLogger.Printf("Admin %s failed to revoke JWT tokens for %s: %v", adminUsername, targetUsername, err)
-		return JSONError(c, http.StatusInternalServerError, "Failed to revoke user JWT tokens")
 	}
 
 	// Log security event
@@ -357,6 +356,17 @@ func OpaqueRegisterFinalize(c echo.Context) error {
 		return JSONError(c, http.StatusInternalServerError, "Failed to store user record")
 	}
 
+	// Per-entityID positive throttle on successful registrations. Counts only
+	// completed account creations over a rolling 24h window; denied attempts
+	// do not consume a slot. See handlers/registration_throttle.go.
+	throttleAllowed, throttleErr := enforceRegistrationThrottle(c)
+	if throttleErr != nil {
+		return JSONError(c, http.StatusServiceUnavailable, "Registration throttle unavailable")
+	}
+	if !throttleAllowed {
+		return nil // 429 already written
+	}
+
 	// Start transaction for atomic user + OPAQUE record creation
 	tx, err := database.DB.Begin()
 	if err != nil {
@@ -365,8 +375,11 @@ func OpaqueRegisterFinalize(c echo.Context) error {
 	}
 	defer tx.Rollback()
 
-	// Create user record
-	_, err = models.CreateUser(tx, request.Username)
+	// Create user record. The auto-approval policy is read live so an admin
+	// can flip it at runtime via `arkfile-admin set-approval-policy` without a
+	// restart. require_approval=false => auto-approved with approved_by="system";
+	// true => created pending explicit admin approval.
+	_, err = models.CreateUser(tx, request.Username, !config.RequireApproval())
 	if err != nil {
 		logging.ErrorLogger.Printf("Failed to create user %s: %v", request.Username, err)
 		return JSONError(c, http.StatusInternalServerError, "User creation failed")
@@ -388,6 +401,10 @@ func OpaqueRegisterFinalize(c echo.Context) error {
 		logging.ErrorLogger.Printf("Failed to commit transaction for %s: %v", request.Username, err)
 		return JSONError(c, http.StatusInternalServerError, "User creation failed")
 	}
+
+	// Account the completed registration against the per-entityID throttle.
+	// Best-effort: the account already exists; a logging failure must not undo it.
+	recordSuccessfulRegistration(c, request.Username)
 
 	// Clean up session after successful registration
 	if err := auth.DeleteAuthSession(database.DB, request.SessionID); err != nil {

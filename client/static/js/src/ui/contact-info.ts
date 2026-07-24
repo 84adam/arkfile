@@ -6,6 +6,7 @@
 
 import { authenticatedFetch } from '../utils/auth';
 import { showError, showSuccess } from './messages';
+import { closeNavInlinePanelsExcept } from './sections.js';
 
 const VALID_CONTACT_TYPES = [
   'email', 'sms', 'signal', 'whatsapp', 'wechat', 'telegram', 'matrix', 'other'
@@ -31,14 +32,8 @@ export async function toggleContactInfoPanel(): Promise<void> {
   const isHidden = panel.classList.contains('hidden');
   panel.classList.toggle('hidden');
 
-  // Close security settings if open
-  const securityPanel = document.getElementById('security-settings');
-  if (securityPanel && !securityPanel.classList.contains('hidden')) {
-    securityPanel.classList.add('hidden');
-  }
-
-  // Load contact info when opening the panel
   if (isHidden) {
+    closeNavInlinePanelsExcept('contact-info-panel');
     await loadContactInfo();
   }
 }

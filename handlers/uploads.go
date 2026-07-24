@@ -19,6 +19,7 @@ import (
 	"github.com/labstack/echo/v4"
 
 	"github.com/arkfile/Arkfile/auth"
+	"github.com/arkfile/Arkfile/billing"
 	"github.com/arkfile/Arkfile/config"
 	"github.com/arkfile/Arkfile/crypto"
 	"github.com/arkfile/Arkfile/database"
@@ -39,8 +40,7 @@ var (
 // client can otherwise open arbitrary numbers of init'd-but-never-completed
 // sessions, occupying storage they have not yet finalized and starving
 // themselves of the ability to upload anything new. The cap is per-user, so
-// it never affects unrelated users. See docs/wip/general-enhancements.md
-// item 4.
+// it never affects unrelated users.
 const maxInProgressUploadSessionsPerUser = 4
 
 // Max allocation defense-in-depth ceiling for appended padding chunk-obscuring bytes.
@@ -71,10 +71,11 @@ func CreateUploadSession(c echo.Context) error {
 		Sha256sumNonce     string `json:"sha256sum_nonce"`
 		EncryptedFek       string `json:"encrypted_fek"`
 
-		TotalSize    int64  `json:"total_size"`
-		ChunkSize    int    `json:"chunk_size"`
-		PasswordHint string `json:"password_hint"`
-		PasswordType string `json:"password_type"`
+		TotalSize             int64  `json:"total_size"`
+		ChunkSize             int    `json:"chunk_size"`
+		EncryptedPasswordHint string `json:"encrypted_password_hint"`
+		PasswordHintNonce     string `json:"password_hint_nonce"`
+		PasswordType          string `json:"password_type"`
 	}
 
 	// Bind the JSON request body to the struct
@@ -120,6 +121,18 @@ func CreateUploadSession(c echo.Context) error {
 			"Invalid password type")
 	}
 
+	// Encrypted hint fields are opaque and must both be present or both omitted.
+	hasHintCipher := request.EncryptedPasswordHint != ""
+	hasHintNonce := request.PasswordHintNonce != ""
+	if hasHintCipher != hasHintNonce {
+		return JSONErrorCode(c, http.StatusBadRequest, "invalid_password_hint",
+			"encrypted_password_hint and password_hint_nonce must both be present or both omitted")
+	}
+	if request.PasswordType != "custom" && (hasHintCipher || hasHintNonce) {
+		return JSONErrorCode(c, http.StatusBadRequest, "invalid_password_hint",
+			"password hint fields are only valid for custom password files")
+	}
+
 	// Check user's storage limit and approval status
 	user, err := models.GetUserByUsername(database.DB, username)
 	if err != nil {
@@ -131,17 +144,33 @@ func CreateUploadSession(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusForbidden, "Account pending approval. File uploads are restricted until your account is approved by an administrator. You can still access other features of your account.")
 	}
 
-	// Soft-block uploads on negative credit balance if payments integration is enabled
+	// Soft-block uploads once a pay-as-you-go balance reaches the configured
+	// negative-balance cap. Only applies when billing is enabled; login and
+	// downloads remain available so users can retrieve their data and settle up.
 	cfg, err := config.LoadConfig()
-	if err == nil && cfg.Payments.Enabled {
-		credits, err := models.GetUserCredits(database.DB, username)
-		if err == nil && credits != nil && credits.BalanceUSDMicrocents < 0 {
+	if err == nil && cfg.Billing.Enabled && cfg.Billing.PaygEnabled && billing.ShouldApplyPaygUploadCap(database.DB, username) {
+		credits, creditsErr := models.GetUserCredits(database.DB, username)
+		if creditsErr != nil {
+			logging.ErrorLogger.Printf("Upload balance check failed: %v", creditsErr)
+		} else if credits != nil && credits.BalanceUSDMicrocents <= -cfg.Billing.PaygNegativeBalanceLimitMicrocents() {
 			return JSONErrorCode(c, http.StatusPaymentRequired, "payment_required",
-				"Your credit balance is negative. Please top up your balance to upload new files.")
+				"Your credit balance has reached the negative balance limit. Please top up to upload new files.")
 		}
 	}
 
-	if !user.CheckStorageAvailable(request.TotalSize) {
+	subBlocked, subErr := billing.SubscriptionUploadBlocked(database.DB, username)
+	if subErr != nil {
+		logging.ErrorLogger.Printf("Upload subscription check failed for %s: %v", username, subErr)
+	} else if subBlocked {
+		return JSONErrorCode(c, http.StatusPaymentRequired, "subscription_past_due",
+			"Your subscription payment is past due. Please update your payment method to upload new files.")
+	}
+
+	storageOK, storageErr := billing.CheckStorageAvailable(database.DB, username, request.TotalSize)
+	if storageErr != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to check storage availability")
+	}
+	if !storageOK {
 		return echo.NewHTTPError(http.StatusForbidden, "Storage limit would be exceeded")
 	}
 
@@ -157,25 +186,12 @@ func CreateUploadSession(c echo.Context) error {
 		request.ChunkSize = int(crypto.PlaintextChunkSize())
 	}
 
-	// Compute the expected number of chunks from the *encrypted* total size.
-	//
-	// chunks are uniform [nonce (12)][ciphertext][tag (16)] with no
-	// per-chunk envelope header. The FEK envelope still carries
-	// [version][key_type] but it lives in file_metadata.encrypted_fek,
-	// not in the chunk stream. So every encrypted chunk is exactly
-	// `ChunkSize + 28` bytes (last chunk may be smaller).
-	//
-	//   encryptedChunkSize = ChunkSize + 28  (plaintext + GCM overhead)
-	//   totalChunks        = ceil(TotalSize / encryptedChunkSize)
-	const aesGcmOverheadBytes = 28 // nonce(12) + tag(16)
-	encryptedChunkSize := int64(request.ChunkSize) + aesGcmOverheadBytes
-	var totalChunks int64
-	if request.TotalSize <= 0 {
-		// Empty file: still record one (empty) chunk for accounting.
-		totalChunks = 1
-	} else {
-		totalChunks = (request.TotalSize + encryptedChunkSize - 1) / encryptedChunkSize
-	}
+	// Canonical chunk count from encrypted stream length and plaintext chunk size.
+	// Each stored chunk is [nonce][ciphertext][tag] with span chunk_size + AesGcmOverhead().
+	// request.TotalSize is the client-declared encrypted-stream length before
+	// server padding; the server stores it as size_bytes for billing/quota and
+	// chunk byte-range math (intentional operational metadata — see docs/security.md).
+	totalChunks := models.CalculateChunkCount(request.TotalSize, int64(request.ChunkSize))
 
 	// Begin transaction
 	tx, err := database.DB.Begin()
@@ -189,8 +205,7 @@ func CreateUploadSession(c echo.Context) error {
 	// they cannot interfere with other users. The cleanup marks expired
 	// in-progress sessions as 'abandoned' so they no longer count toward the
 	// cap. The count is taken inside the same transaction as the subsequent
-	// INSERT, so we cannot race past the cap. See docs/wip/general-enhancements.md
-	// item 4.
+	// INSERT, so we cannot race past the cap.
 	if _, err := tx.Exec(
 		`UPDATE upload_sessions
 		    SET status = 'abandoned', updated_at = CURRENT_TIMESTAMP
@@ -215,8 +230,7 @@ func CreateUploadSession(c echo.Context) error {
 		logging.InfoLogger.Printf("User %s blocked at upload session cap (%d in-progress, max %d)",
 			username, inProgressCount, maxInProgressUploadSessionsPerUser)
 		// Stable error code 'too_many_in_progress_uploads' lets clients switch
-		// on a code rather than parsing English. Aligned with the standing
-		// pattern in docs/wip/general-enhancements.md item 9.
+		// on a code rather than parsing English.
 		return JSONErrorCodeData(c, http.StatusTooManyRequests,
 			"too_many_in_progress_uploads",
 			fmt.Sprintf("You have %d upload(s) already in progress (max %d). Cancel one or wait for it to complete or expire.", inProgressCount, maxInProgressUploadSessionsPerUser),
@@ -282,8 +296,8 @@ func CreateUploadSession(c echo.Context) error {
 	// pre-check above and this INSERT, surface the same stable
 	// file_id_conflict code so the client can retry uniformly.
 	_, err = tx.Exec(
-		"INSERT INTO upload_sessions (id, file_id, encrypted_filename, filename_nonce, encrypted_sha256sum, sha256sum_nonce, encrypted_fek, owner_username, total_size, chunk_size, total_chunks, password_hint, password_type, storage_id, padded_size, status, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		sessionID, fileID, encryptedFilename, filenameNonce, encryptedSha256sum, sha256sumNonce, encryptedFek, username, request.TotalSize, request.ChunkSize, totalChunks, request.PasswordHint, request.PasswordType, storageID, paddedSize, "in_progress", time.Now().Add(24*time.Hour),
+		"INSERT INTO upload_sessions (id, file_id, encrypted_filename, filename_nonce, encrypted_sha256sum, sha256sum_nonce, encrypted_fek, owner_username, total_size, chunk_size, total_chunks, encrypted_password_hint, password_hint_nonce, password_type, storage_id, padded_size, status, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		sessionID, fileID, encryptedFilename, filenameNonce, encryptedSha256sum, sha256sumNonce, encryptedFek, username, request.TotalSize, request.ChunkSize, totalChunks, request.EncryptedPasswordHint, request.PasswordHintNonce, request.PasswordType, storageID, paddedSize, "in_progress", time.Now().Add(24*time.Hour),
 	)
 	if err != nil {
 		if isUniqueConstraintFileID(err) {
@@ -768,14 +782,15 @@ func CompleteUpload(c echo.Context) error {
 	// int64 or float64 depending on value magnitude. Type switches convert
 	// them cleanly — no NullFloat64 workarounds.
 	var (
-		ownerUsername   string
-		fileID          sql.NullString
-		storageID       sql.NullString
-		storageUploadID sql.NullString
-		status          string
-		totalChunks     int
-		passwordHint    sql.NullString
-		passwordType    sql.NullString
+		ownerUsername     string
+		fileID            sql.NullString
+		storageID         sql.NullString
+		storageUploadID   sql.NullString
+		status            string
+		totalChunks       int
+		encPasswordHint   sql.NullString
+		passwordHintNonce sql.NullString
+		passwordType      sql.NullString
 	)
 
 	// interface{} scans for numeric fields (rqlite may return int64 or float64)
@@ -792,13 +807,13 @@ func CompleteUpload(c echo.Context) error {
 
 	err := database.DB.QueryRow(
 		`SELECT owner_username, file_id, storage_id, storage_upload_id, status, total_chunks,
-                total_size, chunk_size, padded_size, password_hint, password_type, encrypted_filename, filename_nonce,
+                total_size, chunk_size, padded_size, encrypted_password_hint, password_hint_nonce, password_type, encrypted_filename, filename_nonce,
                 encrypted_sha256sum, sha256sum_nonce, encrypted_fek
          FROM upload_sessions WHERE id = ?`,
 		sessionID,
 	).Scan(
 		&ownerUsername, &fileID, &storageID, &storageUploadID, &status, &totalChunks,
-		&totalSizeRaw, &chunkSizeRaw, &paddedSizeRaw, &passwordHint, &passwordType,
+		&totalSizeRaw, &chunkSizeRaw, &paddedSizeRaw, &encPasswordHint, &passwordHintNonce, &passwordType,
 		&encryptedFilenameBytes, &filenameNonceBytes, &encryptedSha256sumBytes, &sha256sumNonceBytes, &encryptedFekBytes,
 	)
 
@@ -984,21 +999,21 @@ func CompleteUpload(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusBadRequest, "Upload size mismatch: stored size does not match expected padded size")
 	}
 
-	// Calculate chunk_count from the encrypted data size (not padded)
-	var chunkCount int64 = 1
-	if declaredSize > 0 && chunkSizeBytes > 0 {
-		chunkCount = (declaredSize + chunkSizeBytes - 1) / chunkSizeBytes
+	// Persist the validated init total_chunks (canonical encrypted-stream accounting).
+	chunkCount := int64(totalChunks)
+	if chunkCount <= 0 {
+		chunkCount = models.CalculateChunkCount(declaredSize, chunkSizeBytes)
 	}
 
 	// Create the final file metadata record with chunk info for resumable downloads.
 	// size_bytes = declaredSize (the encrypted ciphertext size, used for chunk byte-range calculations on download).
 	// padded_size = paddedSize (the actual S3 object size, includes crypto-random padding appended to the last chunk).
-	// encrypted_file_sha256sum = hash of encrypted data only (pre-padding).
+	// encrypted_stream_sha256sum = hash of encrypted data only (pre-padding).
 	// stored_blob_sha256sum = hash of all bytes stored in S3 (encrypted data + padding).
 	_, err = tx.Exec(`
-		INSERT INTO file_metadata (file_id, storage_id, owner_username, password_hint, password_type, filename_nonce, encrypted_filename, sha256sum_nonce, encrypted_sha256sum, encrypted_file_sha256sum, stored_blob_sha256sum, encrypted_fek, size_bytes, padded_size, chunk_count, chunk_size_bytes)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		fileID.String, storageID.String, username, passwordHint.String, passwordType.String, filenameNonce, encryptedFilename, sha256sumNonce, encryptedSha256sum, serverCalculatedHash, storedBlobHash, encryptedFek, declaredSize, paddedSize, chunkCount, chunkSizeBytes,
+		INSERT INTO file_metadata (file_id, storage_id, owner_username, encrypted_password_hint, password_hint_nonce, password_type, filename_nonce, encrypted_filename, sha256sum_nonce, encrypted_sha256sum, encrypted_stream_sha256sum, stored_blob_sha256sum, encrypted_fek, size_bytes, padded_size, chunk_count, chunk_size_bytes)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		fileID.String, storageID.String, username, encPasswordHint.String, passwordHintNonce.String, passwordType.String, filenameNonce, encryptedFilename, sha256sumNonce, encryptedSha256sum, serverCalculatedHash, storedBlobHash, encryptedFek, declaredSize, paddedSize, chunkCount, chunkSizeBytes,
 	)
 	if err != nil {
 		if isUniqueConstraintFileID(err) {
@@ -1046,10 +1061,10 @@ func CompleteUpload(c echo.Context) error {
 	replicateToSecondary(fileID.String, storageID.String, paddedSize)
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"message":               "File uploaded successfully",
-		"file_id":               fileID.String,
-		"storage_id":            storageID.String,
-		"encrypted_file_sha256": serverCalculatedHash,
+		"message":                 "File uploaded successfully",
+		"file_id":                 fileID.String,
+		"storage_id":              storageID.String,
+		"encrypted_stream_sha256": serverCalculatedHash,
 		"storage": map[string]interface{}{
 			"total_bytes":     user.TotalStorageBytes,
 			"limit_bytes":     user.StorageLimitBytes,

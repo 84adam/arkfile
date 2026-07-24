@@ -22,7 +22,7 @@ func openPaymentInvoicesTestDB(t *testing.T) *sql.DB {
 			username TEXT UNIQUE NOT NULL,
 			username_folded TEXT UNIQUE NOT NULL,
 			total_storage_bytes BIGINT NOT NULL DEFAULT 0,
-			storage_limit_bytes BIGINT NOT NULL DEFAULT 1181116006,
+			storage_limit_bytes BIGINT NOT NULL DEFAULT 1073741824,
 			is_approved BOOLEAN NOT NULL DEFAULT 1,
 			is_admin BOOLEAN NOT NULL DEFAULT 0
 		);
@@ -30,13 +30,13 @@ func openPaymentInvoicesTestDB(t *testing.T) *sql.DB {
 			invoice_id TEXT PRIMARY KEY,
 			username TEXT NOT NULL,
 			amount_usd_microcents BIGINT NOT NULL,
-			status TEXT NOT NULL DEFAULT 'pending',
+			status TEXT NOT NULL DEFAULT 'creating',
 			provider TEXT NOT NULL,
 			provider_invoice_id TEXT UNIQUE,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			FOREIGN KEY(username) REFERENCES users(username) ON DELETE RESTRICT,
-			CHECK(status IN ('pending', 'paid', 'expired', 'failed')),
+			CHECK(status IN ('creating', 'pending', 'paid', 'expired', 'failed')),
 			CHECK(provider IN ('btcpay'))
 		);
 	`

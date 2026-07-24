@@ -15,13 +15,13 @@ package main
 // default; pass --json for machine-readable JSON.
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
-	"time"
+
+	"github.com/arkfile/Arkfile/cli/flags"
 )
 
 // handleBillingCommand is the top-level dispatcher for `arkfile-admin billing ...`.
@@ -159,8 +159,9 @@ func showOneUser(client *HTTPClient, token, username string, jsonOut bool) error
 
 // handleBillingSetPriceCommand updates the customer price.
 func handleBillingSetPriceCommand(client *HTTPClient, config *AdminConfig, args []string) error {
+	args, jsonFromTail := flags.PopBool(args, "--json")
 	fs := flag.NewFlagSet("billing set-price", flag.ExitOnError)
-	jsonOut := fs.Bool("json", false, "Emit JSON instead of formatted text")
+	jsonOut := fs.Bool("json", jsonFromTail, "Emit JSON instead of formatted text")
 	fs.Usage = func() {
 		fmt.Print(`Usage: arkfile-admin billing set-price USD-per-TB-per-month [--json]
 
@@ -415,19 +416,6 @@ FLAGS:
 	return nil
 }
 
-// requireBillingSession loads the admin session and verifies it's not expired.
-// Returns a friendly error otherwise. Used by every billing subcommand.
-func requireBillingSession(config *AdminConfig) (*AdminSession, error) {
-	session, err := loadAdminSession(config.TokenFile)
-	if err != nil {
-		return nil, fmt.Errorf("not logged in as admin (use 'arkfile-admin login'): %w", err)
-	}
-	if time.Now().After(session.ExpiresAt) {
-		return nil, fmt.Errorf("admin session expired, please login again")
-	}
-	return session, nil
-}
-
 // looksLikeDollarsAndCents is a friendly local pre-check. The server still
 // validates rigorously via models.ParseCreditsFromUSD; this just catches
 // obvious typos before they cost a round-trip.
@@ -459,22 +447,6 @@ func looksLikeDollarsAndCents(s string) bool {
 	return true
 }
 
-// emptyOrValue returns fallback when v is empty, otherwise v. Used by the
-// formatted output paths to render gracefully when the server omits a field.
-func emptyOrValue(v, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
-}
-
-// printJSON pretty-prints v to stdout.
-func printJSON(v interface{}) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
 // printPriceSummary renders a `billing show` price block.
 func printPriceSummary(d map[string]interface{}) {
 	available := safeBool(d, "available")
@@ -494,7 +466,7 @@ func printPriceSummary(d map[string]interface{}) {
 
 // printSweepSummary renders the per-day sweep activity table.
 func printSweepSummary(d map[string]interface{}, days int) {
-	negativeCount := int(safeFloat64(d, "users_currently_negative"))
+	negativeCount := int(safeFloat64(d, "users_currently_overdrawn"))
 	fmt.Printf("Sweep summary (last %d days):\n", days)
 	fmt.Printf("  Users currently with negative balance: %d\n\n", negativeCount)
 

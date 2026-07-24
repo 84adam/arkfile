@@ -164,21 +164,20 @@ func RegisterRoutes() {
 	mfaProtectedGroup.GET("/api/shares", ListShares)                      // List user's shares
 	mfaProtectedGroup.POST("/api/shares/:id/revoke", RevokeShare)         // Revoke a share
 
-	// Anonymous share access (no authentication required) - separate namespace with rate limiting
-	// Using /api/public/shares to avoid conflicts with authenticated /api/shares routes
+	// Anonymous share API (no authentication). Page HTML is only at /shared/:id below.
+	// Using /api/public/shares to avoid conflicts with authenticated /api/shares routes.
 	publicShareGroup := Echo.Group("/api/public/shares")
-	publicShareGroup.Use(ShareEnumerationMiddleware) // Entity-global enumeration protection FIRST
-	publicShareGroup.Use(ShareRateLimitMiddleware)   // Then per-share-ID rate limiting (fail fast for abusers)
-	publicShareGroup.Use(TimingProtectionMiddleware) // Then timing protection (for valid requests)
-	publicShareGroup.GET("/:id", GetSharedFile)      // Share access page
-
-	// Share page (serves shared.html for /shared/:id URLs - no authentication required).
-	// To prevent URL enumeration sweeps and timing-attack mapping on this legacy path,
-	// we protect it with the exact same middleware group.
-	Echo.GET("/shared/:id", ShareEnumerationMiddleware(ShareRateLimitMiddleware(TimingProtectionMiddleware(GetSharedFile))))
+	publicShareGroup.Use(ShareEnumerationMiddleware)                    // Entity-global enumeration protection FIRST
+	publicShareGroup.Use(ShareRateLimitMiddleware)                      // Then per-share-ID rate limiting (fail fast for abusers)
+	publicShareGroup.Use(TimingProtectionMiddleware)                    // Then timing protection (for valid requests)
 	publicShareGroup.GET("/:id/envelope", GetShareEnvelope)             // Get share envelope for client-side decryption
+	publicShareGroup.POST("/:id/ticket", IssueShareDownloadTicket)      // Exchange static download token for short-lived ticket
 	publicShareGroup.GET("/:id/metadata", GetShareDownloadMetadata)     // Get metadata for shared file download
 	publicShareGroup.GET("/:id/chunks/:chunkIndex", DownloadShareChunk) // Download chunk of shared file
+
+	// Pretty share URL: serves shared.html for /shared/:id (no authentication).
+	// Same enumeration / rate-limit / timing middleware as the public share API.
+	Echo.GET("/shared/:id", ShareEnumerationMiddleware(ShareRateLimitMiddleware(TimingProtectionMiddleware(GetSharedFile))))
 
 	// File export token - requires TOTP (creates short-lived download token)
 	mfaProtectedGroup.POST("/api/files/:fileId/export-token", CreateExportToken)
@@ -212,8 +211,15 @@ func RegisterRoutes() {
 	mfaProtectedGroup.POST("/api/billing/invoice", CreateInvoiceHandler)
 	mfaProtectedGroup.GET("/api/billing/invoice/:invoice_id", GetInvoiceStatusHandler)
 
-	// Webhook endpoint (public, unauthenticated)
+	// Subscriptions (Subscription Bridge consumer)
+	mfaProtectedGroup.GET("/api/subscriptions/plans", ListSubscriptionPlansHandler)
+	mfaProtectedGroup.GET("/api/subscriptions/me", GetMySubscriptionHandler)
+	mfaProtectedGroup.POST("/api/subscriptions/checkout", CreateSubscriptionCheckoutHandler)
+	mfaProtectedGroup.POST("/api/subscriptions/portal", CreateSubscriptionPortalHandler)
+
+	// Webhook endpoints (public, unauthenticated)
 	Echo.POST("/api/webhooks/btcpay", BTCPayWebhookHandler)
+	Echo.POST("/api/webhooks/subscription-bridge", SubscriptionBridgeWebhookHandler)
 
 	// Admin API endpoints - structured for future expansion.
 	// Stack: JWTMiddleware (validates aud=arkfile-api, rejects temp tokens at signature/audience)
@@ -268,6 +274,8 @@ func RegisterRoutes() {
 	// System monitoring - admin endpoints
 	adminGroup.GET("/system/status", AdminSystemStatus)
 	adminGroup.GET("/system/health", AdminSystemHealth)
+	adminGroup.GET("/system/approval-policy", AdminGetApprovalPolicy)
+	adminGroup.POST("/system/approval-policy", AdminSetApprovalPolicy)
 	adminGroup.POST("/system/prepare-user-secret-master-rotation", AdminPrepareUserSecretMasterRotation)
 	adminGroup.POST("/system/prepare-envelope-master-rotation", AdminPrepareEnvelopeMasterRotation)
 	adminGroup.POST("/system/rotate-jwt-keys", AdminRotateJWTKeys)
@@ -309,6 +317,15 @@ func RegisterRoutes() {
 	adminGroup.POST("/payments/invoice/:invoice_id/sync", AdminSyncInvoiceHandler)
 	adminGroup.POST("/payments/reconcile", AdminReconcilePaymentsHandler)
 
+	// Subscriptions - admin endpoints
+	adminGroup.GET("/subscriptions/plans", AdminListSubscriptionPlansHandler)
+	adminGroup.POST("/subscriptions/plans", AdminUpsertSubscriptionPlanHandler)
+	adminGroup.GET("/subscriptions/users/:username", AdminGetUserSubscriptionHandler)
+	adminGroup.POST("/subscriptions/users/:username/grant-gift-subscription", AdminGrantGiftSubscriptionHandler)
+	adminGroup.POST("/subscriptions/users/:username/cancel-gift-subscription", AdminCancelGiftSubscriptionHandler)
+	adminGroup.POST("/subscriptions/users/:username/sync", AdminSyncUserSubscriptionHandler)
+	adminGroup.POST("/subscriptions/reconcile", AdminReconcileSubscriptionsHandler)
+
 	// Development/Testing admin endpoints (gated by ADMIN_DEV_TEST_API_ENABLED)
 	// SECURITY: These endpoints are ONLY for development and testing
 	if isDevTestAdminAPIEnabled() {
@@ -319,13 +336,18 @@ func RegisterRoutes() {
 		devTestAdminGroup.Use(RequireMFA)
 		devTestAdminGroup.Use(AdminMiddleware)
 		devTestAdminGroup.POST("/users/cleanup", AdminCleanupTestUser)
-		devTestAdminGroup.GET("/mfa/decrypt-check/:username", AdminMFADecryptCheck)
 
 		// Billing tick-now: forces an immediate tick (and optional sweep).
 		// Lives under /dev-test so it is physically not registered as a
 		// route in production-flavored deployments. Used by the e2e billing
 		// test in scripts/testing/e2e-test.sh.
 		devTestAdminGroup.POST("/billing/tick-now", AdminBillingTickNow)
+
+		// Registration throttle reset: clears the registration_attempts table
+		// so the e2e throttle-interaction test can run from a known state and
+		// so it does not leave the test host's entityID in a multi-hour
+		// cooldown that would block manual testing afterward. Dev/test only.
+		devTestAdminGroup.POST("/registration-throttle/reset", AdminResetRegistrationThrottle)
 	}
 }
 

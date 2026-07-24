@@ -205,7 +205,7 @@ func handleUploadCommand(client *HTTPClient, config *ClientConfig, args []string
 		return err
 	}
 
-	accountKey, err := requireAccountKey()
+	accountKey, err := requireAccountKey(config)
 	if err != nil {
 		return err
 	}
@@ -421,23 +421,30 @@ func uploadOneFile(client *HTTPClient, session *AuthSession, config *ClientConfi
 			return "", fmt.Errorf("failed to encrypt metadata: %w", merr)
 		}
 
+		encHintB64, hintNonceB64, herr := encryptPasswordHint(hint, accountKey, fileID, ownerUsername)
+		if herr != nil {
+			clearBytes(fek)
+			return "", fmt.Errorf("failed to encrypt password hint: %w", herr)
+		}
+
 		returnedFileID, derr := doChunkedUpload(client, session, &ChunkedUploadParams{
-			FilePath:        filePath,
-			FileID:          fileID,
-			OwnerUsername:   ownerUsername,
-			FEK:             fek,
-			KeyTypeByte:     keyTypeByte,
-			EncryptedFEKB64: encryptedFEKB64,
-			EncFilenameB64:  encFilenameB64,
-			FnNonceB64:      fnNonceB64,
-			EncSHA256B64:    encSHA256B64,
-			ShaNonceB64:     shaNonceB64,
-			PasswordType:    finalPasswordType,
-			PasswordHint:    hint,
-			FileSizeBytes:   fileSizeBytes,
-			TotalEncSize:    totalEncSize,
-			ChunkCount:      chunkCount,
-			ChunkSizeBytes:  chunkSizeBytes,
+			FilePath:              filePath,
+			FileID:                fileID,
+			OwnerUsername:         ownerUsername,
+			FEK:                   fek,
+			KeyTypeByte:           keyTypeByte,
+			EncryptedFEKB64:       encryptedFEKB64,
+			EncFilenameB64:        encFilenameB64,
+			FnNonceB64:            fnNonceB64,
+			EncSHA256B64:          encSHA256B64,
+			ShaNonceB64:           shaNonceB64,
+			PasswordType:          finalPasswordType,
+			EncPasswordHintB64:    encHintB64,
+			PasswordHintNonceB64:  hintNonceB64,
+			FileSizeBytes:         fileSizeBytes,
+			TotalEncSize:          totalEncSize,
+			ChunkCount:            chunkCount,
+			ChunkSizeBytes:        chunkSizeBytes,
 		})
 		// Clear FEK as soon as the upload returns (success or failure).
 		clearBytes(fek)
@@ -448,7 +455,7 @@ func uploadOneFile(client *HTTPClient, session *AuthSession, config *ClientConfi
 			// Store digest in agent cache for fast dedup on future uploads.
 			agentClient, agentErr := NewAgentClient()
 			if agentErr == nil {
-				if err := agentClient.AddDigest(fileID, sha256hex); err != nil {
+				if err := agentClient.AddDigest(fileID, sha256hex, session.AccessToken); err != nil {
 					logVerbose("Warning: failed to store digest in cache: %v", err)
 				}
 			}
@@ -488,22 +495,23 @@ func isFileIDConflict(err error) bool {
 // every chunk and the FEK envelope. OwnerUsername is bound into the
 // AAD of the metadata fields (filename and SHA-256 digest).
 type ChunkedUploadParams struct {
-	FilePath        string
-	FileID          string
-	OwnerUsername   string
-	FEK             []byte
-	KeyTypeByte     byte
-	EncryptedFEKB64 string
-	EncFilenameB64  string
-	FnNonceB64      string
-	EncSHA256B64    string
-	ShaNonceB64     string
-	PasswordType    string
-	PasswordHint    string
-	FileSizeBytes   int64
-	TotalEncSize    int64
-	ChunkCount      int64
-	ChunkSizeBytes  int64
+	FilePath             string
+	FileID               string
+	OwnerUsername        string
+	FEK                  []byte
+	KeyTypeByte          byte
+	EncryptedFEKB64      string
+	EncFilenameB64       string
+	FnNonceB64           string
+	EncSHA256B64         string
+	ShaNonceB64          string
+	PasswordType         string
+	EncPasswordHintB64   string // empty = omit from init payload
+	PasswordHintNonceB64 string // empty = omit from init payload
+	FileSizeBytes        int64
+	TotalEncSize         int64
+	ChunkCount           int64
+	ChunkSizeBytes       int64
 }
 
 // doChunkedUpload performs the streaming chunked upload to the server.
@@ -526,7 +534,11 @@ func doChunkedUpload(client *HTTPClient, session *AuthSession, params *ChunkedUp
 		"total_size":          params.TotalEncSize,
 		"chunk_size":          int64(chunkSize),
 		"password_type":       params.PasswordType,
-		"password_hint":       params.PasswordHint,
+	}
+	// Empty hint: omit both fields (do not send empty strings).
+	if params.EncPasswordHintB64 != "" && params.PasswordHintNonceB64 != "" {
+		initPayload["encrypted_password_hint"] = params.EncPasswordHintB64
+		initPayload["password_hint_nonce"] = params.PasswordHintNonceB64
 	}
 
 	initResp, err := client.makeRequestWithSession("POST", "/api/uploads/init", initPayload, session)
@@ -536,13 +548,6 @@ func doChunkedUpload(client *HTTPClient, session *AuthSession, params *ChunkedUp
 
 	uploadID, ok := initResp.Data["session_id"].(string)
 	if !ok || uploadID == "" {
-		// Try upload_id as fallback
-		uploadID, ok = initResp.Data["upload_id"].(string)
-	}
-	if !ok || uploadID == "" {
-		uploadID = initResp.SessionID
-	}
-	if uploadID == "" {
 		return "", fmt.Errorf("server did not return session_id")
 	}
 
@@ -683,7 +688,7 @@ func handleDownloadCommand(client *HTTPClient, config *ClientConfig, args []stri
 		return err
 	}
 
-	accountKey, err := requireAccountKey()
+	accountKey, err := requireAccountKey(config)
 	if err != nil {
 		return err
 	}
@@ -742,6 +747,16 @@ func handleDownloadCommand(client *HTTPClient, config *ClientConfig, args []stri
 	case "account", "":
 		kek = accountKey
 	case "custom":
+		if fileMeta.EncryptedPasswordHint != "" && fileMeta.PasswordHintNonce != "" {
+			if hintText, herr := decryptMetadataField(
+				fileMeta.EncryptedPasswordHint, fileMeta.PasswordHintNonce, accountKey,
+				*fileID, crypto.AADFieldPasswordHint, ownerUsername,
+			); herr == nil && hintText != "" {
+				fmt.Printf("Password hint: %s\n", hintText)
+			} else if herr != nil {
+				logVerbose("Warning: failed to decrypt password hint: %v", herr)
+			}
+		}
 		customPass, err := readPassword(fmt.Sprintf("Enter custom password for '%s': ", *outputPath))
 		if err != nil {
 			return fmt.Errorf("failed to read custom password: %w", err)
@@ -935,8 +950,7 @@ func handleListFilesCommand(client *HTTPClient, config *ClientConfig, args []str
 		var accountKey []byte
 		agentClient, agentErr := NewAgentClient()
 		if agentErr == nil {
-			// Pass empty token for read-only listing (no session binding check)
-			accountKey, _ = agentClient.GetAccountKey("")
+			accountKey, _ = agentClient.GetAccountKey(session.AccessToken)
 		}
 
 		decryptedFiles := make([]DecryptedFile, 0, len(fileList.Files))
@@ -982,8 +996,7 @@ func handleListFilesCommand(client *HTTPClient, config *ClientConfig, args []str
 	var accountKey []byte
 	agentClient, agentErr := NewAgentClient()
 	if agentErr == nil {
-		// Pass empty token for read-only listing (no session binding check)
-		accountKey, _ = agentClient.GetAccountKey("")
+		accountKey, _ = agentClient.GetAccountKey(session.AccessToken)
 	}
 
 	sep := strings.Repeat("-", 80)
@@ -1156,7 +1169,7 @@ func handleShareCreate(client *HTTPClient, config *ClientConfig, args []string) 
 		return err
 	}
 
-	accountKey, err := requireAccountKey()
+	accountKey, err := requireAccountKey(config)
 	if err != nil {
 		return err
 	}
@@ -1184,12 +1197,29 @@ func handleShareCreate(client *HTTPClient, config *ClientConfig, args []string) 
 		return fmt.Errorf("failed to decode file metadata: %w", err)
 	}
 
+	// Owner endpoint: owner_username == authenticated user. Fall back to
+	// session.Username if the server response omits it.
+	ownerUsername := fileMeta.OwnerUsername
+	if ownerUsername == "" {
+		ownerUsername = session.Username
+	}
+
 	// Determine source KEK to unwrap the FEK
 	var sourceKEK []byte
 	switch fileMeta.PasswordType {
 	case "account", "":
 		sourceKEK = accountKey
 	case "custom":
+		if fileMeta.EncryptedPasswordHint != "" && fileMeta.PasswordHintNonce != "" {
+			if hintText, herr := decryptMetadataField(
+				fileMeta.EncryptedPasswordHint, fileMeta.PasswordHintNonce, accountKey,
+				*fileID, crypto.AADFieldPasswordHint, ownerUsername,
+			); herr == nil && hintText != "" {
+				fmt.Printf("Password hint: %s\n", hintText)
+			} else if herr != nil {
+				logVerbose("Warning: failed to decrypt password hint: %v", herr)
+			}
+		}
 		customPass, err := readPassword("Enter custom password for this file: ")
 		if err != nil {
 			return fmt.Errorf("failed to read custom password: %w", err)
@@ -1207,12 +1237,6 @@ func handleShareCreate(client *HTTPClient, config *ClientConfig, args []string) 
 	defer clearBytes(fek)
 
 	// Decrypt plaintext filename and SHA-256 (always encrypted with account key).
-	// Owner endpoint: owner_username == authenticated user. Fall back to
-	// session.Username if the server response omits it.
-	ownerUsername := fileMeta.OwnerUsername
-	if ownerUsername == "" {
-		ownerUsername = session.Username
-	}
 
 	filename := "[unknown]"
 	if fileMeta.EncryptedFilename != "" && fileMeta.FilenameNonce != "" {
@@ -1389,8 +1413,7 @@ func handleShareList(client *HTTPClient, config *ClientConfig, args []string) er
 
 	var sharesResp ShareListResponse
 	if err := json.Unmarshal(body, &sharesResp); err != nil {
-		fmt.Println(string(body))
-		return nil
+		return fmt.Errorf("failed to decode share list: %w", err)
 	}
 
 	enrichedShares := make([]EnrichedShareInfo, 0)
@@ -1479,7 +1502,7 @@ func enrichShareList(client *HTTPClient, session *AuthSession, shares []ShareInf
 	var accountKey []byte
 	agentClient, agentErr := NewAgentClient()
 	if agentErr == nil {
-		accountKey, _ = agentClient.GetAccountKey("")
+		accountKey, _ = agentClient.GetAccountKey(session.AccessToken)
 	}
 
 	enriched := make([]EnrichedShareInfo, 0, len(shares))
@@ -1655,6 +1678,126 @@ func handleShareRevoke(client *HTTPClient, config *ClientConfig, args []string) 
 	return nil
 }
 
+// shareTicketHolder obtains and caches a short-lived share download ticket,
+// refreshing it on demand. It mirrors the browser ShareTicketHolder so both
+// clients use the same credential flow against /api/public/shares/:id/ticket.
+type shareTicketHolder struct {
+	client        *HTTPClient
+	shareID       string
+	downloadToken string // base64 static token from the envelope (proof of decryption)
+	ticket        string
+	expiresAt     time.Time
+}
+
+func newShareTicketHolder(client *HTTPClient, shareID, downloadTokenB64 string) *shareTicketHolder {
+	return &shareTicketHolder{client: client, shareID: shareID, downloadToken: downloadTokenB64}
+}
+
+// get returns a valid ticket, fetching or refreshing as needed.
+func (h *shareTicketHolder) get() (string, error) {
+	if h.ticket != "" && time.Now().Before(h.expiresAt) {
+		return h.ticket, nil
+	}
+	return h.refresh()
+}
+
+// refresh forces a fresh ticket from the server.
+func (h *shareTicketHolder) refresh() (string, error) {
+	body, err := json.Marshal(map[string]string{"download_token": h.downloadToken})
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal ticket request: %w", err)
+	}
+	ticketURL := h.client.baseURL + "/api/public/shares/" + h.shareID + "/ticket"
+	req, err := http.NewRequest("POST", ticketURL, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to create ticket request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := h.client.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to request share ticket: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("ticket issuance failed (HTTP %d): %s", resp.StatusCode, string(respBody))
+	}
+
+	var parsed struct {
+		Ticket    string `json:"ticket"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", fmt.Errorf("failed to decode ticket response: %w", err)
+	}
+	if parsed.Ticket == "" {
+		return "", fmt.Errorf("ticket response missing ticket field")
+	}
+	h.ticket = parsed.Ticket
+	// Refresh a bit before the server-stated expiry to avoid races.
+	lead := 30 * time.Second
+	if d := time.Duration(parsed.ExpiresIn) * time.Second; d > lead {
+		h.expiresAt = time.Now().Add(d - lead)
+	} else {
+		h.expiresAt = time.Now().Add(5 * time.Second)
+	}
+	return h.ticket, nil
+}
+
+// setShareAuthHeader sets X-Share-Ticket on the request, refreshing the ticket if needed.
+func setShareAuthHeader(req *http.Request, h *shareTicketHolder) error {
+	ticket, err := h.get()
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Share-Ticket", ticket)
+	return nil
+}
+
+// fetchShareChunkWithTicketRefresh downloads one encrypted share chunk, sending
+// the short-lived X-Share-Ticket. On a 403 (ticket expired mid-download) it
+// forces a ticket refresh and retries the chunk once.
+func fetchShareChunkWithTicketRefresh(client *HTTPClient, h *shareTicketHolder, shareID string, chunkIndex, chunkCount int64) ([]byte, error) {
+	chunkURL := fmt.Sprintf("%s/api/public/shares/%s/chunks/%d", client.baseURL, shareID, chunkIndex)
+
+	doFetch := func() (*http.Response, error) {
+		req, err := http.NewRequest("GET", chunkURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create chunk request: %w", err)
+		}
+		if err := setShareAuthHeader(req, h); err != nil {
+			return nil, fmt.Errorf("failed to obtain share ticket: %w", err)
+		}
+		return client.client.Do(req)
+	}
+
+	resp, err := doFetch()
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == http.StatusForbidden {
+		resp.Body.Close()
+		if _, refreshErr := h.refresh(); refreshErr != nil {
+			return nil, fmt.Errorf("chunk %d returned 403 and ticket refresh failed: %w", chunkIndex, refreshErr)
+		}
+		resp, err = doFetch()
+		if err != nil {
+			return nil, err
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("server returned HTTP %d for chunk %d/%d", resp.StatusCode, chunkIndex+1, chunkCount)
+	}
+	encChunk, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("failed to read chunk %d: %w", chunkIndex, readErr)
+	}
+	return encChunk, nil
+}
+
 func handleShareDownload(client *HTTPClient, config *ClientConfig, args []string) error {
 	fs := flag.NewFlagSet("share download", flag.ExitOnError)
 	shareID := fs.String("share-id", "", "Share ID to download")
@@ -1753,12 +1896,22 @@ func handleShareDownload(client *HTTPClient, config *ClientConfig, args []string
 	}
 	downloadTokenB64 := encodeBase64(downloadToken)
 
+	// Exchange the static download token (proof of envelope decryption) for a
+	// short-lived, entity-bound download ticket. The ticket is presented as
+	// X-Share-Ticket on chunk fetches and refreshed on 403, replacing the
+	// never-rotated static token as the per-chunk credential. Mirrors the
+	// browser share-access flow.
+	ticketHolder := newShareTicketHolder(client, *shareID, downloadTokenB64)
+
 	// Step 5: Get chunk metadata
 	// GET /api/public/shares/:id/metadata -> {file_id, size_bytes, chunk_count, chunk_size_bytes}
 	chunkMetaURL := client.baseURL + "/api/public/shares/" + *shareID + "/metadata"
 	chunkMetaReq, err := http.NewRequest("GET", chunkMetaURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create chunk metadata request: %w", err)
+	}
+	if err := setShareAuthHeader(chunkMetaReq, ticketHolder); err != nil {
+		return fmt.Errorf("failed to obtain share ticket: %w", err)
 	}
 
 	chunkMetaResp, err := client.client.Do(chunkMetaReq)
@@ -1815,37 +1968,14 @@ func handleShareDownload(client *HTTPClient, config *ClientConfig, args []string
 	}
 
 	// Step 7: Stream download + decrypt each chunk
-	// GET /api/public/shares/:id/chunks/:chunkIndex with X-Download-Token header
+	// GET /api/public/shares/:id/chunks/:chunkIndex with X-Share-Ticket header.
+	// On a 403 (ticket expired mid-download), refresh the ticket once and retry.
 	downloadFailed := false
 	for i := int64(0); i < chunkCount; i++ {
-		chunkURL := fmt.Sprintf("%s/api/public/shares/%s/chunks/%d", client.baseURL, *shareID, i)
-		chunkReq, err := http.NewRequest("GET", chunkURL, nil)
-		if err != nil {
-			outFile.Close()
-			os.Remove(*outputPath)
-			return fmt.Errorf("failed to create chunk request: %w", err)
-		}
-		// Download token authenticates the chunk download (no user auth required)
-		chunkReq.Header.Set("X-Download-Token", downloadTokenB64)
-
-		chunkResp, err := client.client.Do(chunkReq)
-		if err != nil {
+		encChunk, chunkErr := fetchShareChunkWithTicketRefresh(client, ticketHolder, *shareID, i, chunkCount)
+		if chunkErr != nil {
 			downloadFailed = true
-			break
-		}
-
-		if chunkResp.StatusCode != http.StatusOK {
-			chunkResp.Body.Close()
-			downloadFailed = true
-			err = fmt.Errorf("server returned HTTP %d for chunk %d", chunkResp.StatusCode, i)
-			break
-		}
-
-		encChunk, readErr := io.ReadAll(chunkResp.Body)
-		chunkResp.Body.Close()
-		if readErr != nil {
-			downloadFailed = true
-			err = fmt.Errorf("failed to read chunk %d: %w", i, readErr)
+			err = chunkErr
 			break
 		}
 
@@ -2231,7 +2361,7 @@ func handleDeleteFileCommand(client *HTTPClient, config *ClientConfig, args []st
 	// Clear digest from agent cache
 	agentClient, agentErr := NewAgentClient()
 	if agentErr == nil {
-		if rmErr := agentClient.RemoveDigest(*fileID); rmErr != nil {
+		if rmErr := agentClient.RemoveDigest(*fileID, session.AccessToken); rmErr != nil {
 			logVerbose("Warning: failed to remove digest from cache: %v", rmErr)
 		}
 	}

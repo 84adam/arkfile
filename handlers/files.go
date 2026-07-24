@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/labstack/echo/v4"
 
@@ -87,29 +88,38 @@ func GetFileMeta(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusForbidden, "Account pending approval. File downloads are restricted until your account is approved by an administrator. You can still access other features of your account.")
 	}
 
-	// Calculate chunk size and total chunks from config
+	// Prefer persisted chunk_count from upload completion (canonical encrypted-stream accounting).
 	chunkSize := crypto.PlaintextChunkSize()
-	totalChunks := (file.SizeBytes + chunkSize - 1) / chunkSize
+	if file.ChunkSizeBytes > 0 {
+		chunkSize = file.ChunkSizeBytes
+	}
+	totalChunks := file.ChunkCount
+	if totalChunks <= 0 {
+		totalChunks = models.CalculateChunkCount(file.SizeBytes, chunkSize)
+	}
 
 	logging.InfoLogger.Printf("File metadata requested: file_id %s (size: %d bytes, chunks: %d)", fileID, file.SizeBytes, totalChunks)
 
-	return c.JSON(http.StatusOK, map[string]interface{}{
-		"file_id":               file.FileID,
-		"owner_username":        file.OwnerUsername, // needed for metadata AAD reconstruction
-		"encrypted_filename":    file.EncryptedFilename,
-		"filename_nonce":        file.FilenameNonce,
-		"encrypted_sha256sum":   file.EncryptedSha256sum,
-		"sha256sum_nonce":       file.Sha256sumNonce,
-		"encrypted_fek":         file.EncryptedFEK,
-		"password_hint":         file.PasswordHint,
-		"password_type":         file.PasswordType,
-		"size_bytes":            file.SizeBytes,
-		"chunk_size":            chunkSize,
-		"total_chunks":          totalChunks,
-		"chunk_count":           file.ChunkCount,
-		"chunk_size_bytes":      file.ChunkSizeBytes,
-		"encrypted_file_sha256": file.EncryptedFileSha256sum.Valid && file.EncryptedFileSha256sum.String != "",
-	})
+	resp := map[string]interface{}{
+		"file_id":             file.FileID,
+		"owner_username":      file.OwnerUsername, // needed for metadata AAD reconstruction
+		"encrypted_filename":  file.EncryptedFilename,
+		"filename_nonce":      file.FilenameNonce,
+		"encrypted_sha256sum": file.EncryptedSha256sum,
+		"sha256sum_nonce":     file.Sha256sumNonce,
+		"encrypted_fek":       file.EncryptedFEK,
+		"password_type":       file.PasswordType,
+		"size_bytes":          file.SizeBytes,
+		"chunk_size":          chunkSize,
+		"total_chunks":        totalChunks,
+		"chunk_count":         totalChunks,
+		"chunk_size_bytes":    chunkSize,
+	}
+	if file.EncryptedPasswordHint != "" && file.PasswordHintNonce != "" {
+		resp["encrypted_password_hint"] = file.EncryptedPasswordHint
+		resp["password_hint_nonce"] = file.PasswordHintNonce
+	}
+	return c.JSON(http.StatusOK, resp)
 }
 
 // ListRecentFileMetadata returns a paginated recent metadata listing for the
@@ -289,50 +299,24 @@ func ListFiles(c echo.Context) error {
 	})
 }
 
-// formatBytes converts bytes to human-readable format
-func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
-}
-
-// AdminContactsHandler returns admin contact information for user support
+// AdminContactsHandler returns admin contact information for user support.
 func AdminContactsHandler(c echo.Context) error {
-	// Get admin usernames from configuration system
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		logging.ErrorLogger.Printf("Failed to load config for admin contacts: %v", err)
-		// Fallback to default
-		return c.JSON(http.StatusOK, map[string]interface{}{
-			"adminUsernames": []string{"default-admin"},
-			"adminContact":   "admin@example.com",
-			"message":        "Contact information for administrators",
-		})
+		return JSONError(c, http.StatusServiceUnavailable, "Configuration unavailable")
 	}
 
 	adminUsernames := cfg.Deployment.AdminUsernames
-	adminContact := cfg.Deployment.AdminContact
-
-	// Fallback if no admin usernames configured
-	if len(adminUsernames) == 0 {
-		adminUsernames = []string{"default-admin"}
+	if adminUsernames == nil {
+		adminUsernames = []string{}
 	}
-
-	// Fallback for admin contact if not configured
-	if adminContact == "" {
-		adminContact = "admin@example.com"
-	}
+	adminContact := strings.TrimSpace(cfg.Deployment.AdminContact)
+	configured := adminContact != "" || len(adminUsernames) > 0
 
 	return c.JSON(http.StatusOK, map[string]interface{}{
-		"adminUsernames": adminUsernames,
-		"adminContact":   adminContact,
-		"message":        "Contact information for administrators",
+		"admin_usernames": adminUsernames,
+		"admin_contact":   adminContact,
+		"configured":      configured,
 	})
 }

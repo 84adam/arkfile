@@ -18,15 +18,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/arkfile/Arkfile/auth"
 	"github.com/arkfile/Arkfile/cli/mfa"
+	"github.com/arkfile/Arkfile/cli/secureinput"
 	"github.com/arkfile/Arkfile/config"
 	"github.com/arkfile/Arkfile/crypto"
 	"github.com/arkfile/Arkfile/utils"
-	"golang.org/x/term"
 )
 
 // Password entry timeouts and limits
@@ -52,11 +51,14 @@ COMMANDS:
     download          Download and decrypt a file (streaming, per-chunk AES-GCM)
     list-files        List files with auto-decrypted filenames
     delete-file       Permanently delete a file from the server
-    share             Manage file shares (create, list, delete, revoke)
+    share             Manage file shares (create, list, revoke, download)
+    revoke-all        Revoke all sessions and refresh tokens
     share download    Download a shared file (no auth required)
     export            Export an encrypted file as a .arkbackup bundle
     decrypt-blob      Decrypt a .arkbackup bundle offline (no network required)
     contact-info      Manage your contact information (get, set, delete)
+    billing           PAYG balance, usage, and top-ups
+    subscription      Subscription plans and Subscription Bridge checkout
     generate-test-file Generate a test file for upload testing
     logout            Logout and clear session
     agent             Manage the agent (start, stop, status)
@@ -120,45 +122,46 @@ type HTTPClient struct {
 
 // Response represents a generic API response
 type Response struct {
-	Success             bool                   `json:"success"`
-	Message             string                 `json:"message"`
-	Data                map[string]interface{} `json:"data"`
-	Error               string                 `json:"error"`
-	TempToken           string                 `json:"temp_token"`
-	SessionKey          string                 `json:"session_key"`
-	RequiresMFA         bool                   `json:"requires_mfa"`
-	Token               string                 `json:"token"`
-	RefreshToken        string                 `json:"refresh_token"`
-	ExpiresAt           time.Time              `json:"expires_at"`
-	SessionID           string                 `json:"session_id"`
-	FileID              string                 `json:"file_id"`
-	StorageID           string                 `json:"storage_id"`
-	EncryptedFileSHA256 string                 `json:"encrypted_file_sha256"`
+	Success               bool                   `json:"success"`
+	Message               string                 `json:"message"`
+	Data                  map[string]interface{} `json:"data"`
+	Error                 string                 `json:"error"`
+	TempToken             string                 `json:"temp_token"`
+	SessionKey            string                 `json:"session_key"`
+	RequiresMFA           bool                   `json:"requires_mfa"`
+	Token                 string                 `json:"token"`
+	RefreshToken          string                 `json:"refresh_token"`
+	ExpiresAt             time.Time              `json:"expires_at"`
+	SessionID             string                 `json:"session_id"`
+	FileID                string                 `json:"file_id"`
+	StorageID             string                 `json:"storage_id"`
+	EncryptedStreamSHA256 string                 `json:"encrypted_stream_sha256"`
 }
 
 // ServerFileInfo represents file metadata from server response.
 //
 // OwnerUsername is required to reconstruct the metadata AAD when
-// decrypting `encrypted_filename` and `encrypted_sha256sum`
-// For owner-only endpoints it equals the
+// decrypting `encrypted_filename`, `encrypted_sha256sum`, and
+// `encrypted_password_hint`. For owner-only endpoints it equals the
 // authenticated user, but the server is the authority on this
 // value so it is taken from the response.
 type ServerFileInfo struct {
-	FileID            string `json:"file_id"`
-	StorageID         string `json:"storage_id"`
-	OwnerUsername     string `json:"owner_username"`
-	PasswordHint      string `json:"password_hint"`
-	PasswordType      string `json:"password_type"`
-	FilenameNonce     string `json:"filename_nonce"`
-	EncryptedFilename string `json:"encrypted_filename"`
-	SHA256Nonce       string `json:"sha256sum_nonce"`
-	EncryptedSHA256   string `json:"encrypted_sha256sum"`
-	EncryptedFEK      string `json:"encrypted_fek"`
-	SizeBytes         int64  `json:"size_bytes"`
-	SizeReadable      string `json:"size_readable"`
-	UploadDate        string `json:"upload_date"`
-	ChunkCount        int64  `json:"chunk_count"`
-	ChunkSizeBytes    int64  `json:"chunk_size_bytes"`
+	FileID                string `json:"file_id"`
+	StorageID             string `json:"storage_id"`
+	OwnerUsername         string `json:"owner_username"`
+	EncryptedPasswordHint string `json:"encrypted_password_hint,omitempty"`
+	PasswordHintNonce     string `json:"password_hint_nonce,omitempty"`
+	PasswordType          string `json:"password_type"`
+	FilenameNonce         string `json:"filename_nonce"`
+	EncryptedFilename     string `json:"encrypted_filename"`
+	SHA256Nonce           string `json:"sha256sum_nonce"`
+	EncryptedSHA256       string `json:"encrypted_sha256sum"`
+	EncryptedFEK          string `json:"encrypted_fek"`
+	SizeBytes             int64  `json:"size_bytes"`
+	SizeReadable          string `json:"size_readable"`
+	UploadDate            string `json:"upload_date"`
+	ChunkCount            int64  `json:"chunk_count"`
+	ChunkSizeBytes        int64  `json:"chunk_size_bytes"`
 }
 
 // ServerFileListResponse represents the server's file list response format
@@ -312,6 +315,16 @@ func main() {
 			logError("Contact info failed: %v", err)
 			os.Exit(1)
 		}
+	case "billing":
+		if err := handleBillingCommand(client, config, args); err != nil {
+			logError("Billing command failed: %v", err)
+			os.Exit(1)
+		}
+	case "subscription":
+		if err := handleSubscriptionCommand(client, config, args); err != nil {
+			logError("Subscription command failed: %v", err)
+			os.Exit(1)
+		}
 	case "revoke-all":
 		if err := handleRevokeAllCommand(config, args); err != nil {
 			logError("Revoke-all failed: %v", err)
@@ -421,6 +434,7 @@ func (c *HTTPClient) makeRequest(method, endpoint string, payload interface{}, t
 	if err := json.Unmarshal(responseData, &apiResp); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
+	populateResponseData(responseData, &apiResp)
 
 	// Extract fields from Data map if present
 	if apiResp.Data != nil {
@@ -448,8 +462,8 @@ func (c *HTTPClient) makeRequest(method, endpoint string, payload interface{}, t
 		if val, ok := apiResp.Data["storage_id"].(string); ok {
 			apiResp.StorageID = val
 		}
-		if val, ok := apiResp.Data["encrypted_file_sha256"].(string); ok {
-			apiResp.EncryptedFileSHA256 = val
+		if val, ok := apiResp.Data["encrypted_stream_sha256"].(string); ok {
+			apiResp.EncryptedStreamSHA256 = val
 		}
 		if val, ok := apiResp.Data["expires_at"].(string); ok {
 			if t, err := time.Parse(time.RFC3339, val); err == nil {
@@ -461,10 +475,40 @@ func (c *HTTPClient) makeRequest(method, endpoint string, payload interface{}, t
 	}
 
 	if resp.StatusCode >= 400 {
-		return &apiResp, fmt.Errorf("HTTP %d: %s", resp.StatusCode, apiResp.Error)
+		errMsg := apiResp.Error
+		if errMsg == "" {
+			errMsg = apiResp.Message
+		}
+		return &apiResp, fmt.Errorf("HTTP %d: %s", resp.StatusCode, errMsg)
 	}
 
 	return &apiResp, nil
+}
+
+// populateResponseData normalizes API payloads into Response.Data.
+// Wrapped responses use {"success":true,"data":{...}}; flat endpoints
+// (e.g. /api/credits) and mixed envelopes (e.g. {"success":true,"plans":[]})
+// expose their fields directly on Data.
+func populateResponseData(responseData []byte, apiResp *Response) {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseData, &raw); err != nil {
+		return
+	}
+	if data, ok := raw["data"].(map[string]interface{}); ok {
+		apiResp.Data = data
+		return
+	}
+	flat := make(map[string]interface{}, len(raw))
+	for k, v := range raw {
+		switch k {
+		case "success", "message", "error":
+			continue
+		}
+		flat[k] = v
+	}
+	if len(flat) > 0 {
+		apiResp.Data = flat
+	}
 }
 
 // fetchOpaqueServerID retrieves the OPAQUE server identity (idS) from the
@@ -522,16 +566,15 @@ func requireSession(config *ClientConfig) (*AuthSession, error) {
 
 // requireAccountKey gets the account key from the agent with session binding validation.
 // Returns a clear error if agent is not running, key is not set, or session has expired/mismatched.
-func requireAccountKey() ([]byte, error) {
+func requireAccountKey(config *ClientConfig) ([]byte, error) {
+	session, err := requireSession(config)
+	if err != nil {
+		return nil, err
+	}
+
 	agentClient, err := NewAgentClient()
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to agent: %w", err)
-	}
-
-	// Load current session to get access token for session binding
-	session, err := loadAuthSession(getSessionFilePath())
-	if err != nil {
-		return nil, fmt.Errorf("not logged in. Please run: arkfile-client login --username <user>")
 	}
 
 	accountKey, err := agentClient.GetAccountKey(session.AccessToken)
@@ -740,26 +783,6 @@ func handleSetupMFACommand(client *HTTPClient, config *ClientConfig, args []stri
 	return nil
 }
 
-func handleSetupTOTPCommand(client *HTTPClient, config *ClientConfig, args []string) error {
-	return handleSetupMFACommand(client, config, args)
-}
-
-// printAutomationBackupCodes emits machine-readable backup code lines for e2e/scripts.
-func printAutomationBackupCodes(backupCodes []interface{}) {
-	for i, c := range backupCodes {
-		codeStr, ok := c.(string)
-		if !ok {
-			continue
-		}
-		switch i {
-		case 0:
-			fmt.Printf("BACKUP_CODE_0:%s\n", codeStr)
-		case 1:
-			fmt.Printf("BACKUP_CODE_1:%s\n", codeStr)
-		}
-	}
-}
-
 func verifyTOTP(client *HTTPClient, config *ClientConfig, session *AuthSession, token, code string) error {
 	verifyResp, err := client.makeRequest("POST", "/api/mfa/verify", map[string]string{"code": code}, token)
 	if err != nil {
@@ -779,7 +802,13 @@ func verifyTOTP(client *HTTPClient, config *ClientConfig, session *AuthSession, 
 
 	mfa.PrintSetupComplete()
 	if backupCodes, ok := verifyResp.Data["backup_codes"].([]interface{}); ok {
-		printAutomationBackupCodes(backupCodes)
+		codes := make([]string, 0, len(backupCodes))
+		for _, c := range backupCodes {
+			if codeStr, ok := c.(string); ok {
+				codes = append(codes, codeStr)
+			}
+		}
+		mfa.PrintAutomationBackupCodes(codes)
 	}
 
 	return nil
@@ -1072,7 +1101,7 @@ func populateDigestCache(client *HTTPClient, session *AuthSession, accountKey []
 		cache[f.FileID] = sha256hex
 	}
 
-	if err := agentClient.StoreDigestCache(cache); err != nil {
+	if err := agentClient.StoreDigestCache(cache, session.AccessToken); err != nil {
 		return fmt.Errorf("failed to store digest cache: %w", err)
 	}
 
@@ -1115,7 +1144,7 @@ func handleAgentCommand(args []string) error {
 	case "stop":
 		return handleAgentStop()
 	case "status":
-		return handleAgentStatus()
+		return handleAgentStatus(args[1:])
 	default:
 		return fmt.Errorf("unknown subcommand: %s", args[0])
 	}
@@ -1172,7 +1201,13 @@ func handleAgentStop() error {
 	return nil
 }
 
-func handleAgentStatus() error {
+func handleAgentStatus(args []string) error {
+	fs := flag.NewFlagSet("agent status", flag.ExitOnError)
+	showDigests := fs.Bool("show-digests", false, "Show digest cache file IDs and SHA-256 digests (diagnostic)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	client, err := NewAgentClient()
 	if err != nil {
 		return fmt.Errorf("failed to create agent client: %w", err)
@@ -1265,15 +1300,22 @@ func handleAgentStatus() error {
 		fmt.Printf("  Access Count:   %.0f\n", v)
 	}
 
-	// Fetch and display digest cache
-	digestCache, err := client.GetDigestCache()
-	if err != nil {
-		fmt.Printf("\nDigest Cache: (error: %v)\n", err)
-	} else {
-		fmt.Printf("\nDigest Cache (%d entries)\n", len(digestCache))
-		for fileID, sha256hex := range digestCache {
-			fmt.Printf("  %s -> %s\n", fileID, sha256hex)
+	if *showDigests {
+		session, err := requireSession(&ClientConfig{TokenFile: getSessionFilePath()})
+		if err != nil {
+			return fmt.Errorf("--show-digests requires an active session: %w", err)
 		}
+		digestCache, err := client.GetDigestCache(session.AccessToken)
+		if err != nil {
+			fmt.Printf("\nDigest Cache: (error: %v)\n", err)
+		} else {
+			fmt.Printf("\nDigest Cache (%d entries)\n", len(digestCache))
+			for fileID, sha256hex := range digestCache {
+				fmt.Printf("  %s -> %s\n", fileID, sha256hex)
+			}
+		}
+	} else if count, ok := status["digest_cache_entries"].(float64); ok {
+		fmt.Printf("\nDigest Cache (%d entries)\n", int(count))
 	}
 
 	return nil
@@ -1335,11 +1377,9 @@ func loadAuthSession(filePath string) (*AuthSession, error) {
 	return &session, nil
 }
 
-// =====================================================================
-// JWT refresh + 401-refresh-retry helpers (used by long-running batch
-// operations like multi-file upload). See docs/wip/general-enhancements.md
-// items 10 and 11.
-// =====================================================================
+// JWT refresh + 401-refresh-retry helpers used by long-running batch
+// operations such as multi-file upload. Distinguishes fatal auth failures
+// from per-file errors so a batch can continue or abort cleanly.
 
 // jwtRefreshThreshold is how close to expiry the access token may be
 // before we proactively refresh it between files in a batch. Default JWT
@@ -1374,10 +1414,7 @@ var errAccountDisabled = errors.New("account is not approved or has been disable
 var errFileIDConflictExhausted = errors.New("file_id conflict retry budget exhausted (3 attempts)")
 
 // isFatalUploadError returns true for errors that should abort an entire
-// batch rather than be recorded against a single file. Mirrors the TS
-// classifier in client/static/js/src/files/upload.ts. This is the seed
-// of the standing pattern described in docs/wip/general-enhancements.md
-// item 11.
+// batch rather than be recorded against a single file.
 func isFatalUploadError(err error) bool {
 	if err == nil {
 		return false
@@ -1612,76 +1649,8 @@ func decodeBase64(s string) ([]byte, error) {
 }
 
 // readPassword reads a password securely from terminal (no echo) or stdin.
-// Includes a timeout to prevent indefinite hangs when stdin is a pipe that
-// gets exhausted, or when a user walks away from an interactive prompt.
 func readPassword(prompt string) ([]byte, error) {
-	fi, err := os.Stdin.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat stdin: %w", err)
-	}
-
-	if (fi.Mode() & os.ModeCharDevice) != 0 {
-		// Interactive terminal mode with timeout
-		if prompt != "" {
-			fmt.Print(prompt)
-		}
-		type readResult struct {
-			data []byte
-			err  error
-		}
-		ch := make(chan readResult, 1)
-		go func() {
-			bytePassword, err := term.ReadPassword(int(syscall.Stdin))
-			ch <- readResult{bytePassword, err}
-		}()
-		select {
-		case result := <-ch:
-			if result.err != nil {
-				fmt.Println()
-				return nil, result.err
-			}
-			fmt.Println()
-			return result.data, nil
-		case <-time.After(PasswordTimeoutInteractive):
-			fmt.Println("\nPassword entry timed out")
-			return nil, fmt.Errorf("password entry timed out after %v", PasswordTimeoutInteractive)
-		}
-	}
-
-	// Not a terminal (pipe mode) with timeout
-	type readResult struct {
-		data []byte
-		err  error
-	}
-	ch := make(chan readResult, 1)
-	go func() {
-		var passwordBytes []byte
-		buf := make([]byte, 1)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil {
-				if err == io.EOF {
-					ch <- readResult{bytes.TrimRight(passwordBytes, "\r"), nil}
-					return
-				}
-				ch <- readResult{nil, fmt.Errorf("failed to read password: %w", err)}
-				return
-			}
-			if n > 0 {
-				if buf[0] == '\n' {
-					break
-				}
-				passwordBytes = append(passwordBytes, buf[0])
-			}
-		}
-		ch <- readResult{bytes.TrimRight(passwordBytes, "\r"), nil}
-	}()
-	select {
-	case result := <-ch:
-		return result.data, result.err
-	case <-time.After(PasswordTimeoutPipe):
-		return nil, fmt.Errorf("password entry timed out after %v (pipe mode)", PasswordTimeoutPipe)
-	}
+	return secureinput.ReadPassword(prompt, PasswordTimeoutInteractive, PasswordTimeoutPipe)
 }
 
 // readPasswordWithStrengthCheck prompts for password, validates strength, loops until valid.

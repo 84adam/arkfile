@@ -122,12 +122,12 @@ func (s *Scheduler) Run(ctx context.Context) error {
 			if sweepErr != nil {
 				logging.ErrorLogger.Printf("billing.Scheduler: sweep failed: %v", sweepErr)
 			} else {
-				logging.InfoLogger.Printf("billing.Scheduler: sweep at %s; %d users settled, total drained = %d microcents, %d users now negative",
-					now.Format(time.RFC3339), summary.UsersSettled, summary.TotalDrainedMicrocents, summary.UsersWithNegativeBalance)
+				logging.InfoLogger.Printf("billing.Scheduler: sweep at %s; %d users settled, %d users now negative",
+					now.Format(time.RFC3339), summary.UsersSettled, summary.UsersWithNegativeBalance)
 			}
 			lastSweepDate = todayDate
 
-			// Skipped-sweep WARN: detect cases where the previous sweep was
+			runSubscriptionMaintenance(s.db)
 			// more than 25h ago (operator-visible signal that a sweep day
 			// was missed; the SweepAllUsers settlement metadata still
 			// reflects the actual elapsed period accurately).
@@ -247,4 +247,24 @@ func maxLastBilledAtAge(db *sql.DB, now time.Time) (time.Duration, bool) {
 		}
 	}
 	return now.UTC().Sub(t.UTC()), true
+}
+
+func runSubscriptionMaintenance(db *sql.DB) {
+	cfg, err := config.LoadConfig()
+	if err != nil || !cfg.Subscriptions.Enabled {
+		return
+	}
+	if n, err := ExpireDueGiftSubscriptions(db); err != nil {
+		logging.ErrorLogger.Printf("billing.Scheduler: gift expiry failed: %v", err)
+	} else if n > 0 {
+		logging.InfoLogger.Printf("billing.Scheduler: expired %d gift subscription(s)", n)
+	}
+	if !cfg.Subscriptions.BridgeEnabled {
+		return
+	}
+	if n, err := ReconcileBridgeSubscriptions(db, 7); err != nil {
+		logging.ErrorLogger.Printf("billing.Scheduler: bridge reconcile failed: %v", err)
+	} else if n > 0 {
+		logging.InfoLogger.Printf("billing.Scheduler: reconciled %d bridge subscription(s)", n)
+	}
 }

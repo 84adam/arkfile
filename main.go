@@ -23,6 +23,7 @@ import (
 	"github.com/arkfile/Arkfile/handlers"
 	"github.com/arkfile/Arkfile/logging"
 	"github.com/arkfile/Arkfile/models"
+	"github.com/arkfile/Arkfile/monitoring"
 	"github.com/arkfile/Arkfile/storage"
 	"github.com/arkfile/Arkfile/utils"
 )
@@ -199,6 +200,8 @@ func main() {
 	}
 	logging.InfoLogger.Printf("Security event logger initialized successfully")
 
+	monitoring.InitDefaultHealthMonitor(database.DB, cfg, config.Version)
+
 	// Initialize storage
 	if err := storage.InitS3(); err != nil {
 		log.Fatalf("Failed to initialize storage: %v", err)
@@ -208,6 +211,7 @@ func main() {
 	// Handles databases created before the column was added to the CREATE TABLE definition.
 	// Silently ignored if the column already exists (fresh installs).
 	runSchemaMigrations()
+	seedSubscriptionsIfConfigured(cfg)
 
 	// Register storage providers in the database and backfill location records
 	registerAndBackfillStorageProviders()
@@ -239,6 +243,15 @@ func main() {
 	billingCtx, cancelBilling := context.WithCancel(context.Background())
 	defer cancelBilling()
 	startBillingScheduler(billingCtx, cfg)
+
+	// Load the persisted auto-approval policy from system_settings (seeding it
+	// from REQUIRE_APPROVAL on first startup) and apply it to the live config
+	// state so an admin's last `set-approval-policy` value survives restarts.
+	if err := loadRequireApprovalSetting(cfg); err != nil {
+		log.Printf("Warning: Failed to load require_approval setting: %v", err)
+		log.Printf("Falling back to REQUIRE_APPROVAL=%t", cfg.Deployment.RequireApproval)
+		config.SetRequireApproval(cfg.Deployment.RequireApproval)
+	}
 
 	// Create Echo instance
 	e := echo.New()
@@ -298,20 +311,8 @@ func main() {
 	tlsPort := cfg.Server.TLSPort
 	tlsEnabled := cfg.Server.TLSEnabled
 
-	// Override with legacy environment variables if present
-	if prodPort := os.Getenv("PROD_PORT"); prodPort != "" {
-		port = prodPort
-	}
-	if testPort := os.Getenv("TEST_PORT"); testPort != "" {
-		testDomain := os.Getenv("TEST_DOMAIN")
-		host := os.Getenv("HOST")
-		if host == testDomain {
-			port = testPort
-		}
-	}
-
 	if port == "" {
-		port = "8080" // Default fallback
+		port = "8080"
 	}
 
 	if tlsEnabled {
@@ -361,6 +362,48 @@ func main() {
 // cleanly without touching the meter (handy for dev-reset.sh which avoids
 // time-dependent test flakiness by disabling billing by default).
 //
+// loadRequireApprovalSetting loads the persisted auto-approval policy from
+// system_settings and applies it to the live config state. On first startup
+// (no row yet) it seeds the row from the env-loaded REQUIRE_APPROVAL default
+// so the admin set-approval-policy endpoint has a value to update.
+func loadRequireApprovalSetting(cfg *config.Config) error {
+	var valueStr string
+	err := database.DB.QueryRow(
+		`SELECT value FROM system_settings WHERE key = ?`,
+		"require_approval",
+	).Scan(&valueStr)
+	if err == sql.ErrNoRows {
+		seed := "false"
+		if cfg.Deployment.RequireApproval {
+			seed = "true"
+		}
+		if _, err := database.DB.Exec(
+			`INSERT INTO system_settings (key, value, updated_by, updated_at)
+			 VALUES (?, ?, 'system', CURRENT_TIMESTAMP)`,
+			"require_approval", seed,
+		); err != nil {
+			return fmt.Errorf("failed to seed require_approval: %w", err)
+		}
+		config.SetRequireApproval(cfg.Deployment.RequireApproval)
+		log.Printf("Seeded require_approval=%t (from REQUIRE_APPROVAL env)", cfg.Deployment.RequireApproval)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to read require_approval: %w", err)
+	}
+
+	switch strings.ToLower(strings.TrimSpace(valueStr)) {
+	case "true", "1":
+		config.SetRequireApproval(true)
+	case "false", "0":
+		config.SetRequireApproval(false)
+	default:
+		return fmt.Errorf("invalid stored require_approval value %q", valueStr)
+	}
+	log.Printf("Loaded require_approval=%s from system_settings", valueStr)
+	return nil
+}
+
 // Wires the handler-side projection seam (handlers.SetBillingProjectionSeams)
 // so /api/credits and admin endpoints can render rate-aware fields. The seam
 // is wired even when billing is disabled, so the response shape stays stable
@@ -452,6 +495,10 @@ func runSchemaMigrations() {
 			description: "Add stored_blob_sha256sum to file_metadata",
 			sql:         "ALTER TABLE file_metadata ADD COLUMN stored_blob_sha256sum CHAR(64)",
 		},
+		{
+			description: "Rename file_metadata.encrypted_file_sha256sum to encrypted_stream_sha256sum",
+			sql:         "ALTER TABLE file_metadata RENAME COLUMN encrypted_file_sha256sum TO encrypted_stream_sha256sum",
+		},
 		// Storage credits / billing meter (v2): rename _cents columns to _microcents.
 		// These run once on first startup after upgrading; safe no-op on subsequent runs
 		// and on fresh installs (where the unified schema already declares _microcents).
@@ -517,7 +564,7 @@ func migrateCreditTransactionsPaymentType() {
 			username TEXT NOT NULL,
 			amount_usd_microcents BIGINT NOT NULL,
 			balance_after_usd_microcents BIGINT NOT NULL,
-			transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'adjustment', 'payment')),
+			transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'payment')),
 			reason TEXT,
 			admin_username TEXT,
 			metadata TEXT,
@@ -544,6 +591,19 @@ func migrateCreditTransactionsPaymentType() {
 		return
 	}
 	log.Printf("Migration: %s applied successfully", desc)
+}
+
+func seedSubscriptionsIfConfigured(cfg *config.Config) {
+	if cfg == nil || !cfg.Subscriptions.Enabled {
+		return
+	}
+	if cfg.Subscriptions.SeedDevPlan || cfg.Deployment.Environment == "development" || os.Getenv("DEBUG_MODE") == "true" {
+		if err := models.SeedDevSubscriptionPlan(database.DB); err != nil {
+			log.Printf("Warning: failed to seed dev subscription plan: %v", err)
+		} else {
+			log.Printf("Seeded dev subscription plan %s", models.DevSubscriptionPlanID)
+		}
+	}
 }
 
 type configuredStorageProvider struct {

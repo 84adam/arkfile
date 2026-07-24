@@ -3,7 +3,7 @@
 # Arkfile Local/LAN Deployment Script
 # First-time constructive deployment for local machines and LANs
 # Uses self-signed TLS, admin bootstrap flow, no Caddy
-# See docs/wip/local-deploy.md for full design document
+# Constructive local/LAN deploy: self-signed TLS, admin bootstrap, no Caddy.
 
 set -e
 
@@ -106,48 +106,7 @@ if [ -z "$ADMIN_USERNAME" ]; then
     exit 1
 fi
 
-# Username validation (mirrors Go validator in utils/username_validator.go)
-validate_username() {
-    local username="$1"
-    local len=${#username}
-
-    if [ "$len" -lt 10 ]; then
-        echo "ERROR: Username must be at least 10 characters (got $len)"
-        return 1
-    fi
-    if [ "$len" -gt 50 ]; then
-        echo "ERROR: Username must be at most 50 characters (got $len)"
-        return 1
-    fi
-    if ! echo "$username" | grep -qE '^[a-z0-9_.,-]{10,50}$'; then
-        echo "ERROR: Username can only contain lowercase letters, numbers, underscores, hyphens, periods, and commas"
-        return 1
-    fi
-    # Cannot start or end with special characters
-    if echo "$username" | grep -qE '^[-_.,]'; then
-        echo "ERROR: Username cannot start with a special character"
-        return 1
-    fi
-    if echo "$username" | grep -qE '[-_.,]$'; then
-        echo "ERROR: Username cannot end with a special character"
-        return 1
-    fi
-    # No consecutive special characters
-    if echo "$username" | grep -qE '\.\.|--|__|,,'; then
-        echo "ERROR: Username cannot contain consecutive special characters"
-        return 1
-    fi
-    return 0
-}
-
-if ! validate_username "$ADMIN_USERNAME"; then
-    echo ""
-    echo "Username requirements: 10-50 characters, lowercase letters/numbers/underscore/hyphen/period/comma"
-    echo "Cannot start or end with special characters, no consecutive special characters"
-    exit 1
-fi
-
-# Source shared build configuration
+# Source shared build configuration and helpers before username validation
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/setup/build-config.sh"
 
@@ -161,50 +120,25 @@ NC='\033[0m'
 
 # Configuration
 ARKFILE_DIR="/opt/arkfile"
-USER="arkfile"
-GROUP="arkfile"
+ARKFILE_USER="arkfile"
+ARKFILE_GROUP="arkfile"
 
 # Preserve original user context for Go operations
 ORIGINAL_USER="${SUDO_USER:-$USER}"
 ORIGINAL_UID="${SUDO_UID:-$(id -u)}"
 ORIGINAL_GID="${SUDO_GID:-$(id -g)}"
 
-# Helper: print status messages
-print_status() {
-    local status=$1
-    local message=$2
-    case $status in
-        "INFO")    echo -e "  ${BLUE}INFO:${NC} ${message}" ;;
-        "SUCCESS") echo -e "  ${GREEN}SUCCESS:${NC} ${message}" ;;
-        "WARNING") echo -e "  ${YELLOW}WARNING:${NC} ${message}" ;;
-        "ERROR")   echo -e "  ${RED}ERROR:${NC} ${message}" ;;
-    esac
-}
+# Shared helpers (print_status, run_as_user, stop_service_*, verify_ownership,
+# validate_username, validate_storage_backend, read_secrets_env_value).
+# Color vars above and ARKFILE_DIR must be set before this is sourced.
+source "$SCRIPT_DIR/setup/deploy-common.sh"
 
-# Helper: verify no root-owned files in a directory
-verify_ownership() {
-    local check_dir="$1"
-    print_status "INFO" "Verifying directory ownership for $check_dir..."
-    local root_owned=$(find "$check_dir" -user root 2>/dev/null | grep -v "^$" || true)
-    if [ -n "$root_owned" ]; then
-        print_status "ERROR" "Found root-owned files/directories:"
-        echo "$root_owned" | while read -r file; do
-            echo "  - $file"
-        done
-        return 1
-    fi
-    print_status "SUCCESS" "All files in $check_dir owned by arkfile user"
-    return 0
-}
-
-# Helper: run commands as original user (not root)
-run_as_user() {
-    if [ "$EUID" -eq 0 ] && [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" -H "$@"
-    else
-        "$@"
-    fi
-}
+if ! validate_username "$ADMIN_USERNAME"; then
+    echo ""
+    echo "Username requirements: 10-50 characters, lowercase letters/numbers/underscore/hyphen/period/comma"
+    echo "Cannot start or end with special characters, no consecutive special characters"
+    exit 1
+fi
 
 # Helper: fix Go file ownership (verbose wrapper)
 fix_go_ownership() {
@@ -215,22 +149,6 @@ fix_go_ownership() {
         [ -f ".vendor_cache" ] && chown "$SUDO_USER:$SUDO_USER" .vendor_cache 2>/dev/null || true
         [ -d "$BUILD_ROOT" ] && chown -R "$SUDO_USER:$SUDO_USER" "$BUILD_ROOT/" 2>/dev/null || true
         print_status "SUCCESS" "Go file ownership restored"
-    fi
-}
-
-# Helper: safely stop a service if running
-stop_service_if_running() {
-    local service_name="$1"
-    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        print_status "INFO" "Stopping $service_name..."
-        systemctl stop "$service_name" || {
-            print_status "WARNING" "Failed to stop $service_name gracefully, trying force stop..."
-            systemctl kill "$service_name" 2>/dev/null || true
-            sleep 2
-        }
-        print_status "SUCCESS" "$service_name stopped"
-    else
-        print_status "INFO" "$service_name not running"
     fi
 }
 
@@ -272,17 +190,7 @@ detect_lan_ip() {
     echo "$lan_ip"
 }
 
-# Storage backend validation
-validate_storage_backend() {
-    case "$1" in
-        local-seaweedfs|wasabi|backblaze|vultr|hetzner|cloudflare-r2|aws-s3|generic-s3)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
+# Storage backend validation is provided by deploy-common.sh (validate_storage_backend).
 
 # Prompt helpers for interactive credential collection
 prompt_nonempty() {
@@ -571,58 +479,24 @@ echo "============================="
 
 fix_go_ownership
 
-# Check C libraries
-SKIP_C_LIBS=false
-if [ "$FORCE_REBUILD_ALL" = "true" ]; then
-    print_status "INFO" "--force-rebuild-all: Deleting entire build directory"
-    rm -rf "$BUILD_ROOT"
-    print_status "SUCCESS" "Build directory deleted"
-elif c_libs_exist; then
-    SKIP_C_LIBS=true
-    print_status "INFO" "Found existing C libraries, will skip rebuild"
-    print_status "INFO" "Use --force-rebuild-all to force C library rebuild"
-fi
+decide_skip_c_libs_for_first_deploy
 
 # Do NOT set LIBOPAQUE_DEFINES (no WASM trace logging for local deployment)
 unset LIBOPAQUE_DEFINES
 print_status "INFO" "WASM trace logging disabled (production build)"
 
-# Force fresh TypeScript rebuild
 print_status "INFO" "Forcing fresh TypeScript rebuild..."
-rm -f client/static/js/.buildcache
-rm -rf client/static/js/dist/*
-# Also remove the streaming-download SW build artifact (top-level), so it
-# is regenerated fresh from src/sw-download.ts on every run.
-rm -f client/static/js/sw-download.js client/static/js/sw-download.js.map
+clear_frontend_build_caches
 
-# Clean build artifacts (preserve C libraries)
 print_status "INFO" "Cleaning build artifacts..."
-if [ -d "$BUILD_ROOT" ]; then
-    if [ "$SKIP_C_LIBS" = "true" ]; then
-        print_status "INFO" "Preserving C libraries in $BUILD_CLIBS"
-        rm -rf "$BUILD_BIN" "$BUILD_CLIENT" "$BUILD_DATABASE" "$BUILD_SYSTEMD" "$BUILD_WEBROOT" 2>/dev/null || true
-        rm -f "$BUILD_ROOT/version.json" 2>/dev/null || true
-        print_status "SUCCESS" "Build artifacts cleaned (C libraries preserved)"
-    else
-        rm -rf "$BUILD_ROOT"
-        print_status "SUCCESS" "Build artifacts cleaned (including C libraries)"
-    fi
+wipe_build_artifacts_preserving_c_libs_if_skipping
+if [ "$SKIP_C_LIBS" = "true" ]; then
+    print_status "SUCCESS" "Build artifacts cleaned (C libraries preserved)"
+else
+    print_status "SUCCESS" "Build artifacts cleaned (including C libraries)"
 fi
 
-# Set version and build
-FALLBACK_VERSION="local-$(date +%Y%m%d-%H%M%S)"
-export VERSION="$FALLBACK_VERSION"
-export SKIP_C_LIBS="$SKIP_C_LIBS"
-
-fix_go_ownership
-
-# Run build as original user
-if ! run_as_user ./scripts/setup/build.sh --build-only; then
-    print_status "ERROR" "Build failed"
-    exit 1
-fi
-
-fix_go_ownership
+run_application_build "local-$(date +%Y%m%d-%H%M%S)"
 print_status "SUCCESS" "Application build complete"
 echo ""
 
@@ -637,36 +511,8 @@ fi
 
 # Verify critical files
 print_status "INFO" "Verifying critical files..."
-
-if [ ! -f "$ARKFILE_DIR/client/static/js/libopaque.js" ]; then
-    print_status "ERROR" "libopaque.js missing from $ARKFILE_DIR"
-    exit 1
-fi
-print_status "SUCCESS" "libopaque.js verified"
-
-if [ ! -f "$ARKFILE_DIR/client/static/js/dist/app.js" ]; then
-    print_status "ERROR" "TypeScript bundle missing from $ARKFILE_DIR"
-    exit 1
-fi
-print_status "SUCCESS" "TypeScript bundle verified"
-
-if [ ! -x "$ARKFILE_DIR/bin/arkfile" ]; then
-    print_status "ERROR" "arkfile binary missing or not executable"
-    exit 1
-fi
-print_status "SUCCESS" "arkfile binary verified"
-
-if [ ! -x "$ARKFILE_DIR/bin/arkfile-client" ]; then
-    print_status "ERROR" "arkfile-client binary missing or not executable"
-    exit 1
-fi
-print_status "SUCCESS" "arkfile-client binary verified"
-
-if [ ! -x "$ARKFILE_DIR/bin/arkfile-admin" ]; then
-    print_status "ERROR" "arkfile-admin binary missing or not executable"
-    exit 1
-fi
-print_status "SUCCESS" "arkfile-admin binary verified"
+verify_deployed_app_artifacts
+print_status "SUCCESS" "Critical deploy artifacts verified"
 
 print_status "SUCCESS" "All critical files in place"
 echo ""
@@ -689,7 +535,7 @@ chmod 700 "$ARKFILE_DIR/etc/keys"
 
 # Create and permission log directory
 mkdir -p "$ARKFILE_DIR/var/log"
-chown "$USER:$GROUP" "$ARKFILE_DIR/var/log"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/var/log"
 chmod 775 "$ARKFILE_DIR/var/log"
 
 print_status "SUCCESS" "Ownership and permissions set"
@@ -769,7 +615,7 @@ EOF
   ]
 }
 EOF
-        chown "$USER:$GROUP" "$ARKFILE_DIR/etc/seaweedfs-s3.json"
+        chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/seaweedfs-s3.json"
         chmod 640 "$ARKFILE_DIR/etc/seaweedfs-s3.json"
         print_status "SUCCESS" "SeaweedFS S3 auth configuration created"
         ;;
@@ -843,10 +689,11 @@ ADMIN_DEV_TEST_API_ENABLED=false
 ARKFILE_BILLING_ENABLED=true
 ARKFILE_CUSTOMER_PRICE_USD_PER_TB_PER_MONTH=10.00
 ARKFILE_BILLING_GIFTED_CREDITS_USD=0.00
-ARKFILE_FREE_STORAGE_BYTES=1181116006
+ARKFILE_FREE_STORAGE_BYTES=1073741824
 ARKFILE_BILLING_TICK_INTERVAL=1h
 ARKFILE_BILLING_SWEEP_AT_UTC=00:15
 ARKFILE_BILLING_INCLUDE_ADMINS=false
+ARKFILE_PAYG_NEGATIVE_BALANCE_LIMIT_USD=10.00
 
 # Payments integration
 ARKFILE_PAYMENTS_ENABLED=false
@@ -858,13 +705,13 @@ ARKFILE_MIN_TOP_UP_USD=0.50
 ARKFILE_MAX_TOP_UP_USD=1000.00
 
 # Local Deployment Settings (NOT development)
-REQUIRE_APPROVAL=true
+REQUIRE_APPROVAL=false
 ENABLE_REGISTRATION=true
 DEBUG_MODE=false
 LOG_LEVEL=info
 EOF
 
-chown "$USER:$GROUP" "$ARKFILE_DIR/etc/secrets.env"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/secrets.env"
 chmod 640 "$ARKFILE_DIR/etc/secrets.env"
 print_status "SUCCESS" "secrets.env created"
 
@@ -879,7 +726,7 @@ cat > "$ARKFILE_DIR/etc/rqlite-auth.json" << EOF
 ]
 EOF
 
-chown "$USER:$GROUP" "$ARKFILE_DIR/etc/rqlite-auth.json"
+chown "$ARKFILE_USER:$ARKFILE_GROUP" "$ARKFILE_DIR/etc/rqlite-auth.json"
 chmod 640 "$ARKFILE_DIR/etc/rqlite-auth.json"
 print_status "SUCCESS" "rqlite auth file created"
 
@@ -1144,30 +991,27 @@ echo "  Arkfile:   ${arkfile_status}"
 echo ""
 echo -e "${YELLOW}NEXT: Bootstrap your admin account${NC}"
 echo ""
-echo "  1. Read the bootstrap token (the file is mode 0400 owned by arkfile):"
-echo "     sudo cat /opt/arkfile/etc/keys/bootstrap-token.bin"
-echo ""
-echo "  2. Bootstrap the admin account (from this machine):"
-echo "     /opt/arkfile/bin/arkfile-admin \\"
+echo "  1. Bootstrap the admin account (using --token-stdin to prevent argv credential exposure):"
+echo "     sudo cat /opt/arkfile/etc/keys/bootstrap-token.bin | /opt/arkfile/bin/arkfile-admin \\"
 echo "       --server-url https://localhost:${TLS_PORT} --tls-insecure \\"
-echo "       bootstrap --token \$(sudo cat /opt/arkfile/etc/keys/bootstrap-token.bin) --username ${ADMIN_USERNAME}"
+echo "       bootstrap --token-stdin --username ${ADMIN_USERNAME}"
 echo ""
-echo "  3. Setup MFA for the admin account (TOTP or security key):"
+echo "  2. Setup MFA for the admin account (TOTP or security key):"
 echo "     /opt/arkfile/bin/arkfile-admin \\"
 echo "       --server-url https://localhost:${TLS_PORT} --tls-insecure \\"
 echo "       setup-mfa"
 echo ""
-echo "  4. Verify admin login:"
+echo "  3. Verify admin login:"
 echo "     /opt/arkfile/bin/arkfile-admin \\"
 echo "       --server-url https://localhost:${TLS_PORT} --tls-insecure \\"
 echo "       login --username ${ADMIN_USERNAME}"
 echo ""
-echo "  5. After successful admin login, disable force bootstrap:"
+echo "  4. After successful admin login, disable force bootstrap:"
 echo "     - Edit /opt/arkfile/etc/secrets.env"
 echo "     - Set ARKFILE_FORCE_ADMIN_BOOTSTRAP=false"
 echo "     - Restart: sudo systemctl restart arkfile"
 echo ""
-echo "  6. Access the web interface:"
+echo "  5. Access the web interface:"
 echo "     https://localhost:${TLS_PORT}"
 echo "     https://${LAN_IP}:${TLS_PORT} (from other devices on your network)"
 echo "     (Accept the self-signed certificate warning)"

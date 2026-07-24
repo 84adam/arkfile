@@ -611,25 +611,25 @@ func TimingProtectionMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-// requiresTimingProtection checks if an endpoint requires timing protection
+// requiresTimingProtection checks if an endpoint requires timing protection.
+//
+// These are the anonymous (no-auth) share-access paths where a fast response
+// would leak whether a share ID exists, enabling share-URL enumeration at line
+// rate. The protected prefixes MUST stay in sync with the public share route
+// group registered in route_config.go (/api/public/shares/* API plus /shared/:id
+// page). The previous prefix list checked /api/share/ which never matched the
+// real /api/public/shares/... routes, silently dropping timing protection on
+// the envelope/metadata/chunk endpoints.
 func requiresTimingProtection(path string) bool {
-	protectedEndpoints := []string{
-		"/api/share/", // Share envelope access (no auth required, client-side decryption)
-		"/shared/",    // Share page access
+	protectedPrefixes := []string{
+		"/api/public/shares/", // Public share envelope/metadata/chunk endpoints (no auth)
+		"/shared/",            // Share access page (no auth)
 	}
 
-	for _, endpoint := range protectedEndpoints {
-		if len(path) >= len(endpoint) && path[:len(endpoint)] == endpoint {
+	for _, prefix := range protectedPrefixes {
+		if strings.HasPrefix(path, prefix) {
 			return true
 		}
-	}
-
-	// Also check for exact matches and patterns that should be protected
-	if path == "/api/share" ||
-		path == "/shared" ||
-		(len(path) > len("/api/share/") && path[:len("/api/share/")] == "/api/share/") ||
-		(len(path) > len("/shared/") && path[:len("/shared/")] == "/shared/") {
-		return true
 	}
 
 	return false
@@ -694,26 +694,6 @@ func RequireApproved(next echo.HandlerFunc) echo.HandlerFunc {
 	}
 }
 
-// RequireAdmin ensures the user has admin privileges before allowing access
-func RequireAdmin(next echo.HandlerFunc) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		username := auth.GetUsernameFromToken(c)
-
-		// Get user details
-		user, err := models.GetUserByUsername(database.DB, username)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get user details")
-		}
-
-		// Check if user has admin privileges
-		if !user.HasAdminPrivileges() {
-			return echo.NewHTTPError(http.StatusForbidden, "Admin privileges required")
-		}
-
-		return next(c)
-	}
-}
-
 // RequireMFA ensures the user has TOTP enabled before allowing access to protected resources.
 // Note: /api/mfa/setup and /api/mfa/verify are on a separate route group using MFAJWTMiddleware
 // and never reach this middleware, so no path-based bypass is needed here.
@@ -749,17 +729,6 @@ func RequireMFA(next echo.HandlerFunc) echo.HandlerFunc {
 
 		return next(c)
 	}
-}
-
-// isLocalhostIP checks if an IP address is localhost without storing or logging it.
-//
-// DEPRECATED for authorization decisions. Use peerAddrIsLoopback(c) instead.
-// This helper takes a net.IP that callers usually obtained from c.RealIP(),
-// which walks X-Forwarded-For under Echo's default extractor and is therefore
-// spoofable. See peerAddrIsLoopback for the correct
-// primitive for "is this request coming from loopback?" authz gates.
-func isLocalhostIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.Equal(net.ParseIP("127.0.0.1")) || ip.Equal(net.ParseIP("::1"))
 }
 
 // AdminMiddleware enforces multi-layer security for admin endpoints

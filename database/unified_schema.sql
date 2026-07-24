@@ -1,7 +1,7 @@
 -- Arkfile Complete Database Schema
 
 -- =====================================================
--- PHASE 1: CORE USER AND FILE MANAGEMENT TABLES
+-- CORE USER AND FILE MANAGEMENT TABLES
 -- =====================================================
 
 -- Users table (foundation for all other tables)
@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
     username_folded TEXT UNIQUE NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     total_storage_bytes BIGINT NOT NULL DEFAULT 0,
-    storage_limit_bytes BIGINT NOT NULL DEFAULT 1181116006,
+    storage_limit_bytes BIGINT NOT NULL DEFAULT 1073741824,
     is_approved BOOLEAN NOT NULL DEFAULT false,
     approved_by TEXT,
     approved_at TIMESTAMP,
@@ -28,14 +28,15 @@ CREATE TABLE IF NOT EXISTS file_metadata (
     file_id VARCHAR(36) UNIQUE NOT NULL,        -- UUID v4 for file identification
     storage_id VARCHAR(36) UNIQUE NOT NULL,     -- UUID v4 for storage backend
     owner_username TEXT NOT NULL,
-    password_hint TEXT,
+    encrypted_password_hint TEXT,               -- base64-encoded AES-GCM encrypted custom-password hint (Account Key + AAD)
+    password_hint_nonce TEXT,                   -- base64-encoded 12-byte nonce for password-hint encryption
     password_type TEXT NOT NULL DEFAULT 'custom',
     filename_nonce TEXT NOT NULL,               -- base64-encoded 12-byte nonce for filename encryption
     encrypted_filename TEXT NOT NULL,           -- base64-encoded AES-GCM encrypted filename
     sha256sum_nonce TEXT NOT NULL,              -- base64-encoded 12-byte nonce for sha256 encryption  
-    encrypted_sha256sum TEXT NOT NULL,          -- base64-encoded AES-GCM encrypted sha256 hash
-    encrypted_file_sha256sum CHAR(64),          -- sha256sum of the final encrypted file in storage (pre-padding)
-    stored_blob_sha256sum CHAR(64),             -- sha256sum of the complete S3 object (encrypted data + padding)
+    encrypted_sha256sum TEXT NOT NULL,          -- base64-encoded AES-GCM ciphertext of plaintext-file SHA-256 (AAD label "encrypted_sha256sum")
+    encrypted_stream_sha256sum CHAR(64),        -- plaintext hex SHA-256 of client-encrypted stream before server padding (server-computed)
+    stored_blob_sha256sum CHAR(64),             -- plaintext hex SHA-256 of complete S3 object (encrypted stream + padding)
     encrypted_fek TEXT NOT NULL,                -- base64-encoded AES-GCM encrypted FEK envelope (AAD-bound to file_id + key_type)
     size_bytes BIGINT NOT NULL DEFAULT 0,
     padded_size BIGINT,                         -- Size with padding for privacy/security
@@ -46,7 +47,7 @@ CREATE TABLE IF NOT EXISTS file_metadata (
 );
 
 -- =====================================================
--- PHASE 2: SYSTEM SECRETS (MASTER KEY ARCHITECTURE)
+-- SYSTEM SECRETS (MASTER KEY ARCHITECTURE)
 -- =====================================================
 
 -- Encrypted system keys (JWT, TOTP, OPAQUE, Bootstrap)
@@ -62,7 +63,7 @@ CREATE TABLE IF NOT EXISTS system_keys (
 );
 
 -- =====================================================
--- PHASE 3: RFC-COMPLIANT OPAQUE AUTHENTICATION
+-- RFC-COMPLIANT OPAQUE AUTHENTICATION
 -- =====================================================
 
 -- OPAQUE server keys (single row table for server-wide keys)
@@ -102,7 +103,7 @@ CREATE TABLE IF NOT EXISTS opaque_auth_sessions (
 );
 
 -- =====================================================
--- PHASE 4: JWT TOKEN MANAGEMENT
+-- JWT TOKEN MANAGEMENT
 -- =====================================================
 
 CREATE TABLE IF NOT EXISTS refresh_tokens (
@@ -191,7 +192,7 @@ CREATE TABLE IF NOT EXISTS mfa_backup_usage (
 );
 
 -- =====================================================
--- PHASE 6: FILE SHARING AND ENCRYPTION
+-- FILE SHARING AND ENCRYPTION
 -- =====================================================
 
 -- Cleanup: Remove deprecated file_shares table (superseded by file_share_keys)
@@ -218,7 +219,7 @@ CREATE TABLE IF NOT EXISTS file_share_keys (
 
 
 -- =====================================================
--- PHASE 7: CHUNKED UPLOAD SYSTEM
+-- CHUNKED UPLOAD SYSTEM
 -- =====================================================
 
 -- Upload sessions for chunked uploads
@@ -233,13 +234,13 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
     total_size BIGINT NOT NULL,
     chunk_size INTEGER NOT NULL,
     total_chunks INTEGER NOT NULL,
-    password_hint TEXT,
+    encrypted_password_hint TEXT,
+    password_hint_nonce TEXT,
     password_type TEXT NOT NULL,
     storage_upload_id TEXT,
     storage_id VARCHAR(36),
     padded_size BIGINT,
     status TEXT NOT NULL DEFAULT 'in_progress',
-    encrypted_hash CHAR(64),
     encrypted_fek TEXT NOT NULL,                -- AAD-bound FEK envelope; never optional
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -261,7 +262,7 @@ CREATE TABLE IF NOT EXISTS upload_chunks (
 );
 
 -- =====================================================
--- PHASE 8: SECURITY AND MONITORING
+-- SECURITY AND MONITORING
 -- =====================================================
 
 -- Security events with privacy-preserving entity identification
@@ -306,8 +307,24 @@ CREATE TABLE IF NOT EXISTS share_access_attempts (
     UNIQUE(share_id, entity_id)
 );
 
+-- Registration throttle: counts successful account creations per entityID over
+-- a rolling 24h window. entity_id is the privacy-preserving composite identifier
+-- (IP + coarse User-Agent/Accept-Language buckets, HMAC'd) from logging.GetOrCreateEntityID;
+-- the raw IP is never stored. username is kept only for audit correlation since
+-- usernames already live in the users table. Rows are pruned after 48h.
+CREATE TABLE IF NOT EXISTS registration_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entity_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_registration_attempts_entity_created
+    ON registration_attempts(entity_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_registration_attempts_cleanup
+    ON registration_attempts(created_at);
+
 -- =====================================================
--- PHASE 9: OPERATIONAL MONITORING
+-- OPERATIONAL MONITORING
 -- =====================================================
 
 -- Entity ID configuration and master secret storage
@@ -349,7 +366,7 @@ CREATE TABLE IF NOT EXISTS security_alerts (
 );
 
 -- =====================================================
--- PHASE 10: ACTIVITY LOGGING
+-- ACTIVITY LOGGING
 -- =====================================================
 
 -- User activity tracking
@@ -374,7 +391,7 @@ CREATE TABLE IF NOT EXISTS admin_logs (
 );
 
 -- =====================================================
--- PHASE 11: CREDITS AND BILLING SYSTEM
+-- CREDITS AND BILLING SYSTEM
 -- =====================================================
 
 -- User credit balances. Denominated in microcents (1 USD = 100 cents = 100,000,000 microcents).
@@ -391,14 +408,14 @@ CREATE TABLE IF NOT EXISTS user_credits (
 );
 
 -- Credit transactions audit log. Amounts denominated in microcents; both fields signed.
--- transaction_type values: 'usage' (daily storage sweep), 'gift' (admin gift), 'adjustment' (admin set), 'payment' (BTCPay top-up).
+-- transaction_type values: 'usage' (daily storage sweep), 'gift' (admin gift), 'payment' (BTCPay top-up).
 CREATE TABLE IF NOT EXISTS credit_transactions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     transaction_id TEXT UNIQUE DEFAULT NULL,          -- External transaction ID MUST be unique to prevent double-spend gifts / duplicate charges
     username TEXT NOT NULL,
     amount_usd_microcents BIGINT NOT NULL,            -- Positive for credits, negative for debits
     balance_after_usd_microcents BIGINT NOT NULL,     -- Balance after this transaction (signed)
-    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'adjustment', 'payment')), -- Constrain transaction_type via CHECK constraint
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'payment')), -- Constrain transaction_type via CHECK constraint
     reason TEXT,                                      -- Human-readable reason
     admin_username TEXT,                              -- NULL for system-generated rows (e.g. usage sweeps)
     metadata TEXT,                                    -- JSON for additional details
@@ -425,6 +442,19 @@ CREATE TABLE IF NOT EXISTS billing_settings (
     updated_by TEXT
 );
 
+-- Generic key/value store for instance-wide runtime settings that admins can
+-- modulate without a restart. Currently keys:
+--   require_approval : "true"/"false" -- auto-approval policy for new
+--                      registrations (seeded from REQUIRE_APPROVAL at startup,
+--                      updated via `arkfile-admin set-approval-policy`).
+-- Mirrors the billing_settings shape.
+CREATE TABLE IF NOT EXISTS system_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by TEXT
+);
+
 -- Persistent system-wide sweep tracking. Prevents duplicated processing
 -- and tracks daily run records.
 CREATE TABLE IF NOT EXISTS billing_sweeps (
@@ -440,18 +470,101 @@ CREATE TABLE IF NOT EXISTS payment_invoices (
     invoice_id TEXT PRIMARY KEY,
     username TEXT NOT NULL,
     amount_usd_microcents BIGINT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
+    status TEXT NOT NULL DEFAULT 'creating',
     provider TEXT NOT NULL,
     provider_invoice_id TEXT UNIQUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(username) REFERENCES users(username) ON DELETE RESTRICT,
-    CHECK(status IN ('pending', 'paid', 'expired', 'failed')),
+    CHECK(status IN ('creating', 'pending', 'paid', 'expired', 'failed')),
     CHECK(provider IN ('btcpay'))
 );
 
 -- =====================================================
--- PHASE 12: USER CONTACT INFORMATION
+-- SUBSCRIPTION PLANS AND SUBSCRIPTION BRIDGE
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS subscription_plans (
+    plan_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    price_usd_cents INTEGER NOT NULL,
+    storage_limit_bytes BIGINT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    is_active BOOLEAN NOT NULL DEFAULT 1,
+    is_public BOOLEAN NOT NULL DEFAULT 1,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS subscription_checkouts (
+    checkout_id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending', 'completed', 'expired', 'canceled')),
+    subscription_ref TEXT UNIQUE,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (username) REFERENCES users(username) ON DELETE RESTRICT,
+    FOREIGN KEY (plan_id) REFERENCES subscription_plans(plan_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_subscription_checkouts_username
+    ON subscription_checkouts(username);
+CREATE INDEX IF NOT EXISTS idx_subscription_checkouts_subscription_ref
+    ON subscription_checkouts(subscription_ref);
+
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    checkout_id TEXT NOT NULL,
+    subscription_ref TEXT UNIQUE NOT NULL,
+    is_current BOOLEAN NOT NULL DEFAULT 1,
+    status TEXT NOT NULL CHECK (status IN (
+        'active', 'past_due', 'canceled', 'expired', 'trialing'
+    )),
+    source TEXT NOT NULL CHECK (source IN ('bridge', 'gift')),
+    state_version BIGINT NOT NULL DEFAULT 0,
+    state_changed_at DATETIME,
+    current_period_start DATETIME NOT NULL,
+    current_period_end DATETIME NOT NULL,
+    cancel_at_period_end BOOLEAN NOT NULL DEFAULT 0,
+    canceled_at DATETIME,
+    past_due_since DATETIME,
+    gift_note TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (username) REFERENCES users(username) ON DELETE RESTRICT,
+    FOREIGN KEY (plan_id) REFERENCES subscription_plans(plan_id) ON DELETE RESTRICT,
+    FOREIGN KEY (checkout_id) REFERENCES subscription_checkouts(checkout_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_username ON user_subscriptions(username);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_status ON user_subscriptions(status);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_subscription_ref ON user_subscriptions(subscription_ref);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_subscriptions_one_current
+    ON user_subscriptions(username) WHERE is_current = 1;
+
+CREATE TABLE IF NOT EXISTS subscription_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT UNIQUE NOT NULL,
+    event_type TEXT NOT NULL,
+    subscription_ref TEXT,
+    checkout_id TEXT,
+    username TEXT,
+    plan_id TEXT,
+    state_version BIGINT NOT NULL DEFAULT 0,
+    state_changed_at DATETIME,
+    disposition TEXT NOT NULL DEFAULT 'applied'
+        CHECK(disposition IN ('applied', 'duplicate', 'ignored_stale')),
+    admin_username TEXT,
+    payload_hash TEXT NOT NULL,
+    processed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- =====================================================
+-- USER CONTACT INFORMATION
 -- =====================================================
 
 -- Encrypted contact details for admin communication
@@ -485,7 +598,7 @@ CREATE TABLE IF NOT EXISTS envelope_master_rotation_mandates (
 );
 
 -- =====================================================
--- PHASE 12B: MULTI-BACKEND STORAGE MANAGEMENT
+-- MULTI-BACKEND STORAGE MANAGEMENT
 -- =====================================================
 
 -- Storage providers: tracks configured S3-compatible backends as first-class entities.
@@ -543,7 +656,7 @@ CREATE TABLE IF NOT EXISTS admin_tasks (
 -- to gracefully handle both fresh installs and existing deployments.
 
 -- =====================================================
--- PHASE 13: INDEXES FOR PERFORMANCE
+-- INDEXES FOR PERFORMANCE
 -- =====================================================
 
 -- Core table indexes
@@ -552,7 +665,7 @@ CREATE INDEX IF NOT EXISTS idx_users_is_approved ON users(is_approved);
 CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users(is_admin);
 
 -- file_metadata.file_id and file_metadata.storage_id are already UNIQUE at the
--- column level (see PHASE 1). No additional non-unique indexes on file_id /
+-- column level (see core user and file management tables above). No additional non-unique indexes on file_id /
 -- storage_id are needed; the implicit unique indexes from the column-level
 -- UNIQUE constraints already serve point lookups.
 CREATE INDEX IF NOT EXISTS idx_file_metadata_owner ON file_metadata(owner_username);
@@ -660,7 +773,7 @@ CREATE INDEX IF NOT EXISTS idx_admin_tasks_type ON admin_tasks(task_type);
 CREATE INDEX IF NOT EXISTS idx_admin_tasks_admin ON admin_tasks(admin_username);
 
 -- =====================================================
--- PHASE 14: TRIGGERS FOR AUTOMATIC UPDATES
+-- TRIGGERS FOR AUTOMATIC UPDATES
 -- =====================================================
 
 -- Update trigger for opaque_user_data
@@ -726,7 +839,7 @@ BEGIN
 END;
 
 -- =====================================================
--- PHASE 15: MONITORING VIEWS
+-- MONITORING VIEWS
 -- =====================================================
 
 -- View for monitoring rate limiting activity

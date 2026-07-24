@@ -26,8 +26,7 @@ success() { echo -e "${GREEN}[OK] $1${NC}"; }
 error()   { echo -e "${RED}[X] $1${NC}"; }
 warning() { echo -e "${YELLOW}[!] $1${NC}"; }
 info()    { echo -e "${CYAN}[i] $1${NC}"; }
-section() { echo -e "\n${BLUE}$1${NC}"; }
-phase()   { echo -e "\n${CYAN}# $1${NC}\n"; }
+section() { echo -e "\n${CYAN}$1${NC}\n"; }
 
 # CONFIGURATION
 
@@ -50,11 +49,11 @@ CLIENT="/opt/arkfile/bin/arkfile-client"
 
 # PREFLIGHT CHECKS
 
-phase "PREFLIGHT CHECKS"
+section "PREFLIGHT CHECKS"
 
 # Check server connectivity
 section "Checking server connectivity"
-if curl -sk --connect-timeout 5 "$SERVER_URL/health" >/dev/null 2>&1; then
+if curl -sk --connect-timeout 5 -f "$SERVER_URL/readyz" >/dev/null 2>&1; then
     success "Server is running at $SERVER_URL"
 else
     error "Server not reachable at $SERVER_URL"
@@ -145,7 +144,7 @@ fi
 
 # INSTALL PLAYWRIGHT (if needed)
 
-phase "DEPENDENCY SETUP"
+section "DEPENDENCY SETUP"
 
 cd "$PROJECT_DIR"
 
@@ -172,12 +171,18 @@ fi
 
 # GENERATE TEST FILES
 
-phase "GENERATING TEST FILES"
+section "GENERATING TEST FILES"
 
 mkdir -p "$PLAYWRIGHT_TEMP_DIR"
 
 TEST_FILE_PATH="$PLAYWRIGHT_TEMP_DIR/pw_test_upload.bin"
 CUSTOM_FILE_PATH="$PLAYWRIGHT_TEMP_DIR/pw_custom_upload.bin"
+REG_FLOW_FILE_PATH="$PLAYWRIGHT_TEMP_DIR/pw_reg_flow_upload.bin"
+
+# Isolated registration-flow credentials (unique username per run)
+REG_FLOW_USERNAME="pwregflow$(date +%s)"
+REG_FLOW_PASSWORD='RegFlowTest2026!SecurePass'
+REG_FLOW_CUSTOM_PASSWORD='RegFlowCustom2026!SecureKey'
 
 section "Creating test files via arkfile-client"
 
@@ -201,14 +206,26 @@ CUSTOM_FILE_SHA256=$(sha256sum "$CUSTOM_FILE_PATH" | awk '{print $1}')
 CUSTOM_FILE_NAME=$(basename "$CUSTOM_FILE_PATH")
 success "Custom file: $CUSTOM_FILE_PATH (SHA-256: ${CUSTOM_FILE_SHA256:0:16}...)"
 
+# Registration-flow custom-password file: 25 MB (26214400 bytes)
+$CLIENT generate-test-file \
+    --filename "$REG_FLOW_FILE_PATH" \
+    --size 26214400 \
+    --pattern sequential
+
+REG_FLOW_FILE_SHA256=$(sha256sum "$REG_FLOW_FILE_PATH" | awk '{print $1}')
+REG_FLOW_FILE_NAME=$(basename "$REG_FLOW_FILE_PATH")
+success "Reg-flow file: $REG_FLOW_FILE_PATH (SHA-256: ${REG_FLOW_FILE_SHA256:0:16}...)"
+
 # RUN PLAYWRIGHT TESTS
 
-phase "RUNNING PLAYWRIGHT TESTS"
+section "RUNNING PLAYWRIGHT TESTS"
 
 info "Server URL: $SERVER_URL"
 info "Test User: $TEST_USERNAME"
 info "Test File: $TEST_FILE_NAME ($TEST_FILE_SHA256)"
 info "Custom File: $CUSTOM_FILE_NAME ($CUSTOM_FILE_SHA256)"
+info "Reg-flow User: $REG_FLOW_USERNAME"
+info "Reg-flow File: $REG_FLOW_FILE_NAME ($REG_FLOW_FILE_SHA256)"
 echo ""
 
 export SERVER_URL
@@ -226,6 +243,12 @@ export SHARE_A_PASSWORD
 export SHARE_B_PASSWORD
 export SHARE_C_PASSWORD
 export PLAYWRIGHT_TEMP_DIR
+export REG_FLOW_FILE_PATH
+export REG_FLOW_FILE_SHA256
+export REG_FLOW_FILE_NAME
+export REG_FLOW_USERNAME
+export REG_FLOW_PASSWORD
+export REG_FLOW_CUSTOM_PASSWORD
 
 # Run Playwright
 PLAYWRIGHT_EXIT_CODE=0
@@ -233,16 +256,16 @@ bunx playwright test --config playwright.config.ts || PLAYWRIGHT_EXIT_CODE=$?
 
 # CLEANUP
 
-phase "CLEANUP"
+section "CLEANUP"
 
 section "Cleaning up test files"
-rm -f "$TEST_FILE_PATH" "$CUSTOM_FILE_PATH"
+rm -f "$TEST_FILE_PATH" "$CUSTOM_FILE_PATH" "$REG_FLOW_FILE_PATH"
 rm -rf "$PLAYWRIGHT_TEMP_DIR/downloads" 2>/dev/null || true
 success "Temp files cleaned up"
 
 # RESULTS
 
-phase "RESULTS"
+section "RESULTS"
 
 if [ $PLAYWRIGHT_EXIT_CODE -eq 0 ]; then
     echo ""

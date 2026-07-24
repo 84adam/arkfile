@@ -73,19 +73,19 @@ ADMIN="$BUILD_DIR/arkfile-admin"
 
 # Test Data Directory
 # MUST be in /tmp
+umask 077
 TEST_DATA_DIR="/tmp/arkfile-e2e-test-data"
 mkdir -p "$TEST_DATA_DIR"
+chmod 700 "$TEST_DATA_DIR"
 MFA_SECRET_FILE="$TEST_DATA_DIR/mfa-secret"
 BACKUP_CODE_PRIMARY_FILE="$TEST_DATA_DIR/backup-code-primary"
 BACKUP_CODE_REENROLL_FILE="$TEST_DATA_DIR/backup-code-reenroll"
-MFA_REENROLL_DONE_FILE="$TEST_DATA_DIR/mfa-reenroll-done"
 MFA_ADMIN_RESET_DONE_FILE="$TEST_DATA_DIR/mfa-admin-reset-done"
 LOG_FILE="$TEST_DATA_DIR/e2e-test.log"
-# Legacy aliases (same files)
-TOTP_SECRET_FILE="$MFA_SECRET_FILE"
-BACKUP_CODE_FILE="$BACKUP_CODE_PRIMARY_FILE"
 
 # Initialize log file
+: > "$LOG_FILE"
+chmod 600 "$LOG_FILE"
 echo "=== ARKFILE E2E TEST LOG - $(date) ===" > "$LOG_FILE"
 
 # COLOR OUTPUT
@@ -103,6 +103,13 @@ warning() { echo -e "${YELLOW}[!] $1${NC}"; echo "[WARN] $1" >> "$LOG_FILE"; }
 info()    { echo -e "${CYAN}[i] $1${NC}"; echo "[INFO] $1" >> "$LOG_FILE"; }
 scenario() { echo -e "\n${BLUE}$1${NC}"; echo -e "\n=== $1 ===" >> "$LOG_FILE"; }
 group()    { echo -e "\n${CYAN}# $1${NC}\n"; echo -e "\n# $1" >> "$LOG_FILE"; }
+
+write_secret_file() {
+    local file_path="$1"
+    local value="$2"
+    printf '%s\n' "$value" > "$file_path"
+    chmod 600 "$file_path"
+}
 
 # TEST RESULT TRACKING
 
@@ -148,10 +155,10 @@ admin_login_with_totp() {
         
     if [ $code -eq 0 ] && echo "$out" | grep -q "Admin login successful"; then
         record_test "$test_name" "PASS"
-        echo "$out"
+        printf '%s\n' "$out"
     else
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
     fi
 }
@@ -178,10 +185,10 @@ user_login_with_totp() {
 
     if [ $code -eq 0 ] && echo "$out" | grep -q "Login successful"; then
         record_test "$test_name" "PASS"
-        echo "$out"
+        printf '%s\n' "$out"
     else
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
     fi
 }
@@ -207,10 +214,10 @@ user_login_with_backup_code() {
 
     if [ $code -eq 0 ] && echo "$out" | grep -q "Login successful"; then
         record_test "$test_name" "PASS"
-        echo "$out"
+        printf '%s\n' "$out"
     else
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
     fi
 }
@@ -229,10 +236,10 @@ user_login_defer_mfa() {
 
     if [ $code -eq 0 ] && echo "$out" | grep -q "MFA challenge pending"; then
         record_test "$test_name" "PASS"
-        echo "$out"
+        printf '%s\n' "$out"
     else
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
     fi
 }
@@ -255,7 +262,7 @@ user_mfa_reenroll_via_backup() {
 
     if [ $code -ne 0 ] || ! echo "$out" | grep -q "MFA Reset Complete"; then
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
         return 1
     fi
@@ -276,7 +283,7 @@ user_mfa_reenroll_via_backup() {
     record_test "MFA re-enrollment issues new secret" "PASS"
 
     export TEST_USER_TOTP_SECRET="$new_secret"
-    echo "$new_secret" > "$MFA_SECRET_FILE"
+    write_secret_file "$MFA_SECRET_FILE" "$new_secret"
 
     local new_backup_code
     new_backup_code=$(echo "$out" | grep '^BACKUP_CODE_0:' | head -1 | cut -d':' -f2 | tr -d ' ')
@@ -285,12 +292,12 @@ user_mfa_reenroll_via_backup() {
         record_test "Backup code capture after re-enrollment" "FAIL"
         return 1
     fi
-    echo "$new_backup_code" > "$BACKUP_CODE_PRIMARY_FILE"
+    write_secret_file "$BACKUP_CODE_PRIMARY_FILE" "$new_backup_code"
     export TEST_USER_BACKUP_CODE="$new_backup_code"
     record_test "Backup code capture after re-enrollment" "PASS"
 
     record_test "$test_name" "PASS"
-    echo "$out"
+    printf '%s\n' "$out"
 }
 
 user_mfa_verify_after_reset() {
@@ -317,13 +324,13 @@ user_mfa_verify_after_reset() {
 
     if [ $code_rc -ne 0 ] || ! echo "$out" | grep -q "MFA setup complete"; then
         error "$test_name failed with output:"
-        echo "$out"
+        printf '%s\n' "$out"
         record_test "$test_name" "FAIL"
         return 1
     fi
 
     record_test "$test_name" "PASS"
-    echo "$out"
+    printf '%s\n' "$out"
 }
 
 user_mfa_enroll_after_deferred_login() {
@@ -336,7 +343,7 @@ user_mfa_enroll_after_deferred_login() {
 
     if [ $setup_exit_code -ne 0 ]; then
         error "Failed to initiate MFA setup after admin reset:"
-        echo "$setup_output"
+        printf '%s\n' "$setup_output"
         record_test "$test_name (setup initiation)" "FAIL"
         return 1
     fi
@@ -345,19 +352,19 @@ user_mfa_enroll_after_deferred_login() {
     secret=$(echo "$setup_output" | grep "TOTP_SECRET:" | cut -d':' -f2 | tr -d ' ')
     if [ -z "$secret" ]; then
         error "Failed to extract TOTP secret after admin reset:"
-        echo "$setup_output"
+        printf '%s\n' "$setup_output"
         record_test "$test_name (setup initiation)" "FAIL"
         return 1
     fi
 
-    echo "$secret" > "$MFA_SECRET_FILE"
+    write_secret_file "$MFA_SECRET_FILE" "$secret"
     export TEST_USER_TOTP_SECRET="$secret"
     record_test "$test_name (setup initiation)" "PASS"
 
     local backup_code
     backup_code=$(echo "$setup_output" | grep '^BACKUP_CODE_0:' | head -1 | cut -d':' -f2 | tr -d ' ')
     if [ -n "$backup_code" ]; then
-        echo "$backup_code" > "$BACKUP_CODE_PRIMARY_FILE"
+        write_secret_file "$BACKUP_CODE_PRIMARY_FILE" "$backup_code"
         export TEST_USER_BACKUP_CODE="$backup_code"
     fi
 
@@ -376,13 +383,13 @@ user_mfa_enroll_after_deferred_login() {
 
     if [ $verify_exit_code -ne 0 ] || ! echo "$verify_output" | grep -q "MFA setup complete"; then
         error "MFA verification after admin reset failed:"
-        echo "$verify_output"
+        printf '%s\n' "$verify_output"
         record_test "$test_name (verify)" "FAIL"
         return 1
     fi
 
     record_test "$test_name (verify)" "PASS"
-    echo "$verify_output"
+    printf '%s\n' "$verify_output"
 }
 
 logout_user_session() {
@@ -413,26 +420,22 @@ logout_admin_session() {
 
 assert_agent_running() {
     local test_name="$1"
-    local status_out
-    status_out=$("$CLIENT" agent status 2>&1) || true
-    echo "[AGENT STATUS] $status_out" >> "$LOG_FILE"
-    if echo "$status_out" | grep -q "NOT RUNNING"; then
+    local status_out status_code
+    safe_exec status_out status_code "$CLIENT" agent status
+    if [ $status_code -ne 0 ]; then
         record_test "$test_name" "FAIL"
+    elif echo "$status_out" | grep -q "Agent Status: RUNNING"; then
+        record_test "$test_name" "PASS"
     else
-        if echo "$status_out" | grep -q "RUNNING"; then
-            record_test "$test_name" "PASS"
-        else
-            record_test "$test_name" "FAIL"
-        fi
+        record_test "$test_name" "FAIL"
     fi
 }
 
 assert_agent_not_running() {
     local test_name="$1"
-    local status_out
-    status_out=$("$CLIENT" agent status 2>&1) || true
-    echo "[AGENT STATUS] $status_out" >> "$LOG_FILE"
-    if echo "$status_out" | grep -q "NOT RUNNING"; then
+    local status_out status_code
+    safe_exec status_out status_code "$CLIENT" agent status
+    if [ $status_code -eq 0 ] && echo "$status_out" | grep -q "Agent Status: NOT RUNNING"; then
         record_test "$test_name" "PASS"
     else
         record_test "$test_name" "FAIL"
@@ -511,14 +514,15 @@ safe_exec() {
     local temp_output
     local temp_exit_code
 
-    echo "[EXEC] $*" >> "$LOG_FILE"
+    local command_name="${1##*/}"
+    echo "[EXEC] $command_name (arguments omitted)" >> "$LOG_FILE"
 
     set +e
     temp_output=$("$@" 2>&1)
     temp_exit_code=$?
     set -e
 
-    echo "$temp_output" >> "$LOG_FILE"
+    printf '%s\n' "$temp_output" >> "$LOG_FILE"
     echo "[EXIT] Code: $temp_exit_code" >> "$LOG_FILE"
     echo "----------------------------------------" >> "$LOG_FILE"
 
@@ -635,10 +639,15 @@ run_preflight() {
     group "Preflight"
 
     scenario "Checking server connectivity"
-    if curl -sk --connect-timeout 5 "$SERVER_URL/health" >/dev/null 2>&1; then
-        record_test "Server connectivity" "PASS"
+    local readyz_body readyz_code
+    readyz_body=$(curl -sk --connect-timeout 5 -w '\n%{http_code}' "$SERVER_URL/readyz" 2>/dev/null || echo -e '\n000')
+    readyz_code=$(echo "$readyz_body" | tail -n1)
+    readyz_body=$(echo "$readyz_body" | sed '$d')
+    if [ "$readyz_code" = "200" ] && echo "$readyz_body" | jq -e '.status == "ready"' >/dev/null 2>&1; then
+        record_test "Server connectivity (/readyz)" "PASS"
     else
-        record_test "Server connectivity" "FAIL"
+        record_test "Server connectivity (/readyz)" "FAIL"
+        error "Preflight /readyz failed (HTTP $readyz_code)"
     fi
 
     scenario "Checking CLI tools"
@@ -655,6 +664,28 @@ run_preflight() {
         info "Using arkfile-admin from: $ADMIN"
     else
         record_test "arkfile-admin available" "FAIL"
+    fi
+
+    scenario "CLI version commands"
+    local client_version_out client_version_code admin_version_out admin_version_code
+    safe_exec client_version_out client_version_code "$CLIENT" version
+    if [ $client_version_code -eq 0 ] && echo "$client_version_out" | grep -Eq '^arkfile-client .+'; then
+        record_test "arkfile-client version" "PASS"
+        info "Client version: $client_version_out"
+    else
+        error "arkfile-client version failed:"
+        echo "$client_version_out"
+        record_test "arkfile-client version" "FAIL"
+    fi
+
+    safe_exec admin_version_out admin_version_code "$ADMIN" version
+    if [ $admin_version_code -eq 0 ] && echo "$admin_version_out" | grep -Eq '^arkfile-admin .+'; then
+        record_test "arkfile-admin version" "PASS"
+        info "Admin version: $admin_version_out"
+    else
+        error "arkfile-admin version failed:"
+        echo "$admin_version_out"
+        record_test "arkfile-admin version" "FAIL"
     fi
 
     success "Environment verification complete"
@@ -743,25 +774,6 @@ run_user_onboarding_mfa_enrollment() {
 
     scenario "Setting up TOTP for user: $TEST_USERNAME"
 
-    # Idempotency: check for existing saved secret and backup codes
-    if [ -f "$MFA_SECRET_FILE" ] && [ -f "$BACKUP_CODE_PRIMARY_FILE" ] && [ -f "$BACKUP_CODE_REENROLL_FILE" ]; then
-        local secret backup_code reenroll_code
-        secret=$(cat "$MFA_SECRET_FILE")
-        backup_code=$(cat "$BACKUP_CODE_PRIMARY_FILE")
-        reenroll_code=$(cat "$BACKUP_CODE_REENROLL_FILE")
-        if [ -n "$secret" ] && [ -n "$backup_code" ] && [ -n "$reenroll_code" ]; then
-            export TEST_USER_TOTP_SECRET="$secret"
-            export TEST_USER_BACKUP_CODE="$backup_code"
-            export TEST_USER_BACKUP_CODE_REENROLL="$reenroll_code"
-            record_test "TOTP setup initiation" "PASS"
-            info "Using existing MFA secret and backup codes"
-            success "MFA enrollment complete (skipped - using existing secret)"
-            return 0
-        fi
-    fi
-
-    rm -f "$MFA_REENROLL_DONE_FILE"
-
     info "Initiating MFA setup..."
     local setup_output
     local setup_exit_code
@@ -771,7 +783,7 @@ run_user_onboarding_mfa_enrollment() {
 
     if [ $setup_exit_code -ne 0 ]; then
         error "Failed to initiate TOTP setup (exit code: $setup_exit_code):"
-        echo "$setup_output"
+        printf '%s\n' "$setup_output"
         record_test "TOTP setup initiation" "FAIL"
     fi
 
@@ -781,14 +793,14 @@ run_user_onboarding_mfa_enrollment() {
 
     if [ -z "$secret" ]; then
         error "Failed to extract TOTP secret from output:"
-        echo "$setup_output"
+        printf '%s\n' "$setup_output"
         record_test "TOTP setup initiation" "FAIL"
     fi
 
-    echo "$secret" > "$MFA_SECRET_FILE"
+    write_secret_file "$MFA_SECRET_FILE" "$secret"
     export TEST_USER_TOTP_SECRET="$secret"
     record_test "TOTP setup initiation" "PASS"
-    info "Got TOTP secret: $secret"
+    info "Captured TOTP secret for automated verification"
 
     # Backup codes are returned on setup (verify only stores hashes server-side).
     local backup_code reenroll_code
@@ -798,7 +810,7 @@ run_user_onboarding_mfa_enrollment() {
         error "Failed to extract primary backup code from setup output"
         record_test "Backup code capture" "FAIL"
     else
-        echo "$backup_code" > "$BACKUP_CODE_PRIMARY_FILE"
+        write_secret_file "$BACKUP_CODE_PRIMARY_FILE" "$backup_code"
         export TEST_USER_BACKUP_CODE="$backup_code"
         record_test "Backup code capture" "PASS"
         info "Saved primary backup code for one-shot login test"
@@ -807,7 +819,7 @@ run_user_onboarding_mfa_enrollment() {
         error "Failed to extract re-enrollment backup code from setup output"
         record_test "Re-enrollment backup code capture" "FAIL"
     else
-        echo "$reenroll_code" > "$BACKUP_CODE_REENROLL_FILE"
+        write_secret_file "$BACKUP_CODE_REENROLL_FILE" "$reenroll_code"
         export TEST_USER_BACKUP_CODE_REENROLL="$reenroll_code"
         record_test "Re-enrollment backup code capture" "PASS"
     fi
@@ -826,17 +838,15 @@ run_user_onboarding_mfa_enrollment() {
         return
     fi
 
-    info "Generated verification code: $code"
-
     safe_exec verify_output verify_exit_code \
         $CLIENT --server-url "$SERVER_URL" --tls-insecure setup-mfa --mfa-method totp --verify "$code"
 
     if [ $verify_exit_code -eq 0 ] && echo "$verify_output" | grep -q "MFA setup complete"; then
         record_test "TOTP verification" "PASS"
-        echo "$verify_output"
+        printf '%s\n' "$verify_output"
     else
         error "TOTP verification failed:"
-        echo "$verify_output"
+        printf '%s\n' "$verify_output"
         record_test "TOTP verification" "FAIL"
     fi
 
@@ -870,9 +880,9 @@ run_dual_mfa_api_checks() {
 
     if [ "$creds_http" = "200" ] && echo "$creds_out" | grep -q 'totp'; then
         record_test "MFA credentials list includes TOTP" "PASS"
-        info "Credentials: $creds_out"
+        info "MFA credentials list returned TOTP enrollment metadata"
     else
-        error "Expected HTTP 200 with TOTP credential; got HTTP $creds_http: $creds_out"
+        error "Expected HTTP 200 with TOTP credential; got HTTP $creds_http"
         record_test "MFA credentials list includes TOTP" "FAIL"
     fi
 
@@ -964,86 +974,107 @@ run_user_onboarding_admin_approval() {
 run_user_authentication() {
     group "User authentication"
 
-    if [ -f "$MFA_REENROLL_DONE_FILE" ]; then
-        info "MFA re-enrollment already completed; loading saved credentials"
-        if [ -f "$MFA_SECRET_FILE" ]; then
-            export TEST_USER_TOTP_SECRET="$(cat "$MFA_SECRET_FILE")"
-        fi
-        if [ -f "$BACKUP_CODE_PRIMARY_FILE" ]; then
-            export TEST_USER_BACKUP_CODE="$(cat "$BACKUP_CODE_PRIMARY_FILE")"
-        fi
-        record_test "MFA re-enrollment via backup code" "PASS"
-    else
-        scenario "MFA re-enrollment via backup code"
-        local old_secret="${TEST_USER_TOTP_SECRET:-}"
-        local reenroll_code="${TEST_USER_BACKUP_CODE_REENROLL:-}"
-        if [ -z "$reenroll_code" ] && [ -f "$BACKUP_CODE_REENROLL_FILE" ]; then
-            reenroll_code=$(cat "$BACKUP_CODE_REENROLL_FILE")
-        fi
-
-        logout_user_session "Logout before MFA re-enrollment"
-        user_login_defer_mfa "OPAQUE login with MFA challenge pending"
-        user_mfa_reenroll_via_backup "MFA re-enrollment via backup code" "$reenroll_code" "$old_secret"
-        user_mfa_verify_after_reset "MFA verify after re-enrollment"
-        touch "$MFA_REENROLL_DONE_FILE"
-        user_login_with_totp "Login with new MFA secret after re-enrollment"
+    scenario "MFA re-enrollment via backup code"
+    local old_secret="${TEST_USER_TOTP_SECRET:-}"
+    local reenroll_code="${TEST_USER_BACKUP_CODE_REENROLL:-}"
+    if [ -z "$reenroll_code" ] && [ -f "$BACKUP_CODE_REENROLL_FILE" ]; then
+        reenroll_code=$(cat "$BACKUP_CODE_REENROLL_FILE")
     fi
+
+    logout_user_session "Logout before MFA re-enrollment"
+    user_login_defer_mfa "OPAQUE login with MFA challenge pending"
+    user_mfa_reenroll_via_backup "MFA re-enrollment via backup code" "$reenroll_code" "$old_secret"
+    user_mfa_verify_after_reset "MFA verify after re-enrollment"
+    user_login_with_totp "Login with new MFA secret after re-enrollment"
 
     scenario "One-shot backup code login as $TEST_USERNAME"
     user_login_with_backup_code "One-shot backup code login"
 
     assert_agent_running "Agent auto-start verification"
-    # Extracts the current refresh token from the session file, calls /api/refresh
-    # to verify rotation works (new JWT returned), then replays the now-superseded
-    # refresh token and verifies the server rejects it with 401.
+
     scenario "Refresh token rotation and reuse detection"
     local session_file="$HOME/.arkfile-session.json"
-    if [ -f "$session_file" ]; then
-        local old_refresh_token
-        old_refresh_token=$(jq -r '.refresh_token // empty' "$session_file" 2>/dev/null)
-        if [ -n "$old_refresh_token" ]; then
-            # Step 1: Rotate the token -- server issues a new JWT + new refresh token
-            local rotate_resp rotate_code
-            rotate_resp=$(curl -sk -o /dev/null -w '%{http_code}' \
-                -X POST "${SERVER_URL}/api/refresh" \
-                -H "Content-Type: application/json" \
-                -d "{\"refresh_token\":\"${old_refresh_token}\"}" 2>/dev/null)
-            if [ "$rotate_resp" = "200" ]; then
-                record_test "Refresh token rotation (200 on first use)" "PASS"
-                info "Refresh token rotation succeeded"
-            else
-                error "Expected 200 from /api/refresh on first use, got HTTP $rotate_resp"
-                record_test "Refresh token rotation (200 on first use)" "FAIL"
-            fi
-
-            # Step 2: Replay the same (now superseded) refresh token -- server must reject it
-            local reuse_resp
-            reuse_resp=$(curl -sk -o /dev/null -w '%{http_code}' \
-                -X POST "${SERVER_URL}/api/refresh" \
-                -H "Content-Type: application/json" \
-                -d "{\"refresh_token\":\"${old_refresh_token}\"}" 2>/dev/null)
-            if [ "$reuse_resp" = "401" ]; then
-                record_test "Refresh token reuse rejected (401 on replay)" "PASS"
-                info "Replayed superseded refresh token correctly rejected with 401"
-            else
-                error "Expected 401 on refresh token replay, got HTTP $reuse_resp"
-                record_test "Refresh token reuse rejected (401 on replay)" "FAIL"
-            fi
-        else
-            warning "Could not extract refresh_token from session file; skipping reuse test"
-            record_test "Refresh token rotation (200 on first use)" "PASS"
-            record_test "Refresh token reuse rejected (401 on replay)" "PASS"
-        fi
-    else
-        warning "Session file not found; skipping reuse test"
-        record_test "Refresh token rotation (200 on first use)" "PASS"
-        record_test "Refresh token reuse rejected (401 on replay)" "PASS"
+    if [ ! -f "$session_file" ]; then
+        error "Session file missing immediately after successful backup-code login"
+        record_test "Refresh token prerequisites" "FAIL"
     fi
 
-    # Re-login after the rotation test consumed the old token (the CLI session
-    # may now hold a stale JWT if curl-based rotation advanced the server state
-    # past the CLI's in-memory token).  A fresh login ensures the remainder of
-    # the test suite starts from a known-good authenticated state.
+    local old_refresh_token
+    if ! old_refresh_token=$(jq -r '.refresh_token // empty' "$session_file" 2>/dev/null); then
+        old_refresh_token=""
+    fi
+    if [ -z "$old_refresh_token" ]; then
+        error "Refresh token missing immediately after successful backup-code login"
+        record_test "Refresh token prerequisites" "FAIL"
+    fi
+    record_test "Refresh token prerequisites" "PASS"
+
+    local rotate_body_file rotate_body rotate_http rotate_code
+    rotate_body_file=$(mktemp "$TEST_DATA_DIR/refresh-rotate.XXXXXX")
+    safe_exec rotate_http rotate_code \
+        curl -skS -o "$rotate_body_file" -w '%{http_code}' \
+        -X POST "${SERVER_URL}/api/refresh" \
+        -H "Content-Type: application/json" \
+        -d "{\"refresh_token\":\"${old_refresh_token}\"}"
+    rotate_body=$(<"$rotate_body_file")
+    rm -f "$rotate_body_file"
+
+    local new_access_token new_refresh_token
+    if ! new_access_token=$(echo "$rotate_body" | jq -r '.data.token // empty' 2>/dev/null); then
+        new_access_token=""
+    fi
+    if ! new_refresh_token=$(echo "$rotate_body" | jq -r '.data.refresh_token // empty' 2>/dev/null); then
+        new_refresh_token=""
+    fi
+    if [ $rotate_code -eq 0 ] \
+        && [ "$rotate_http" = "200" ] \
+        && [ -n "$new_access_token" ] \
+        && [ -n "$new_refresh_token" ] \
+        && [ "$new_refresh_token" != "$old_refresh_token" ]; then
+        record_test "Refresh rotation returns a new token pair" "PASS"
+    else
+        error "Refresh rotation did not return HTTP 200 with a new JWT and refresh token"
+        record_test "Refresh rotation returns a new token pair" "FAIL"
+    fi
+
+    local reuse_http reuse_code
+    safe_exec reuse_http reuse_code \
+        curl -skS -o /dev/null -w '%{http_code}' \
+        -X POST "${SERVER_URL}/api/refresh" \
+        -H "Content-Type: application/json" \
+        -d "{\"refresh_token\":\"${old_refresh_token}\"}"
+    if [ $reuse_code -eq 0 ] && [ "$reuse_http" = "401" ]; then
+        record_test "Refresh token reuse rejected" "PASS"
+    else
+        error "Expected HTTP 401 on superseded refresh-token replay, got HTTP $reuse_http"
+        record_test "Refresh token reuse rejected" "FAIL"
+    fi
+
+    local family_http family_code
+    safe_exec family_http family_code \
+        curl -skS -o /dev/null -w '%{http_code}' \
+        -X POST "${SERVER_URL}/api/refresh" \
+        -H "Content-Type: application/json" \
+        -d "{\"refresh_token\":\"${new_refresh_token}\"}"
+    if [ $family_code -eq 0 ] && [ "$family_http" = "401" ]; then
+        record_test "Refresh-token family revoked after reuse" "PASS"
+    else
+        error "Expected HTTP 401 for refresh token in reused family, got HTTP $family_http"
+        record_test "Refresh-token family revoked after reuse" "FAIL"
+    fi
+
+    local reused_jwt_http reused_jwt_code
+    safe_exec reused_jwt_http reused_jwt_code \
+        curl -skS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${new_access_token}" \
+        "${SERVER_URL}/api/files"
+    if [ $reused_jwt_code -eq 0 ] && [ "$reused_jwt_http" = "401" ]; then
+        record_test "JWT revoked after refresh-token reuse" "PASS"
+    else
+        error "Expected HTTP 401 for JWT after refresh-token reuse, got HTTP $reused_jwt_http"
+        record_test "JWT revoked after refresh-token reuse" "FAIL"
+    fi
+
     user_login_with_totp "User re-login after rotation test"
 
     success "User authentication complete"
@@ -1088,6 +1119,8 @@ run_files_custom_password() {
         error "Failed to generate custom test file:"; echo "$gen_output"
         record_test "Custom test file creation" "FAIL"
     fi
+    # Unique sentinel hint: must never appear as plaintext in API/DB/list output.
+    local CUSTOM_HINT_SENTINEL="e2e-hint-sentinel-$(date +%s)-$$"
     # CLI prompts for: custom password (once) + confirmation (once)
     scenario "Uploading file with custom password"
     local custom_upload_output custom_upload_exit_code
@@ -1097,7 +1130,8 @@ run_files_custom_password() {
         --tls-insecure \
         upload \
         --file '$custom_test_file' \
-        --password-type custom"
+        --password-type custom \
+        --hint '$CUSTOM_HINT_SENTINEL'"
 
     if [ $custom_upload_exit_code -eq 0 ]; then
         CUSTOM_FILE_ID=$(echo "$custom_upload_output" | grep '^\[OK\]' | grep -o 'file_id=[^ )]*' | cut -d= -f2)
@@ -1118,8 +1152,24 @@ run_files_custom_password() {
     if echo "$list_raw_output" | grep -q "custom_test_file.bin" || echo "$list_raw_output" | grep -q "$CUSTOM_FILE_SHA256"; then
         error "Security failure: Raw list API exposed plaintext name or hash for custom-password file!"
         record_test "Raw List API Privacy (custom file)" "FAIL"
-    else
+    elif echo "$list_raw_output" | grep -Fq "$CUSTOM_HINT_SENTINEL"; then
+        error "Security failure: Raw list API exposed plaintext password hint sentinel!"
+        record_test "Raw List API Privacy (custom file)" "FAIL"
+    elif echo "$list_raw_output" | grep -q '"password_hint"'; then
+        error "Security failure: Raw list API still exposes password_hint field!"
+        record_test "Raw List API Privacy (custom file)" "FAIL"
+    elif echo "$list_raw_output" | jq -e --arg fid "$CUSTOM_FILE_ID" '
+        .files[]
+        | select(.file_id == $fid)
+        | (.encrypted_password_hint | type == "string" and length > 0)
+          and (.password_hint_nonce | type == "string" and length > 0)
+          and (.encrypted_filename != null and .encrypted_filename != "")
+      ' >/dev/null 2>&1; then
         record_test "Raw List API Privacy (custom file)" "PASS"
+    else
+        error "Security failure: Raw list API missing encrypted metadata/hint fields for custom-password file!"
+        echo "$list_raw_output" | head -c 2000
+        record_test "Raw List API Privacy (custom file)" "FAIL"
     fi
     # This proves the server-side metadata record is reachable through the CLI's own decryption flow.
     scenario "Verifying custom-password file is accessible via list-files"
@@ -1241,16 +1291,81 @@ run_files_standard() {
         echo "$list_output"
         record_test "File listing verification" "FAIL"
     fi
+
+    scenario "Agent digest privacy and session enforcement"
+    local agent_default_out agent_default_code
+    safe_exec agent_default_out agent_default_code "$CLIENT" agent status
+    if [ $agent_default_code -eq 0 ] \
+        && ! echo "$agent_default_out" | grep -Fq "$UPLOADED_FILE_ID" \
+        && ! echo "$agent_default_out" | grep -Fq "$UPLOADED_FILE_SHA256"; then
+        record_test "Agent status hides file IDs and digests by default" "PASS"
+    else
+        error "Default agent status exposed a file ID or plaintext digest"
+        record_test "Agent status hides file IDs and digests by default" "FAIL"
+    fi
+
+    local agent_digests_out agent_digests_code
+    safe_exec agent_digests_out agent_digests_code "$CLIENT" agent status --show-digests
+    if [ $agent_digests_code -eq 0 ] \
+        && echo "$agent_digests_out" | grep -Fq "$UPLOADED_FILE_ID" \
+        && echo "$agent_digests_out" | grep -Fq "$UPLOADED_FILE_SHA256"; then
+        record_test "Agent diagnostic status shows bound digest cache" "PASS"
+    else
+        error "Diagnostic agent status did not show the expected bound digest entry"
+        record_test "Agent diagnostic status shows bound digest cache" "FAIL"
+    fi
+
+    local client_session_file="$HOME/.arkfile-session.json"
+    local session_backup="$TEST_DATA_DIR/client-session-backup.json"
+    local expired_session="$TEST_DATA_DIR/client-session-expired.json"
+    if [ ! -f "$client_session_file" ]; then
+        error "Client session file missing before expiry enforcement tests"
+        record_test "Client session expiry prerequisites" "FAIL"
+    fi
+    cp "$client_session_file" "$session_backup"
+    if ! jq '.expires_at = "2000-01-01T00:00:00Z"' "$client_session_file" > "$expired_session"; then
+        rm -f "$session_backup" "$expired_session"
+        error "Could not construct an expired client session"
+        record_test "Client session expiry prerequisites" "FAIL"
+    fi
+    mv "$expired_session" "$client_session_file"
+    chmod 600 "$client_session_file"
+
+    local expired_digest_out expired_digest_code
+    safe_exec expired_digest_out expired_digest_code "$CLIENT" agent status --show-digests
+    local expired_list_out expired_list_code
+    safe_exec expired_list_out expired_list_code \
+        "$CLIENT" --server-url "$SERVER_URL" --tls-insecure list-files
+
+    mv "$session_backup" "$client_session_file"
+    chmod 600 "$client_session_file"
+
+    if [ $expired_digest_code -ne 0 ] && echo "$expired_digest_out" | grep -qi "session expired"; then
+        record_test "Agent digest diagnostics reject expired session" "PASS"
+    else
+        error "Agent digest diagnostics did not reject an expired session"
+        record_test "Agent digest diagnostics reject expired session" "FAIL"
+    fi
+    if [ $expired_list_code -ne 0 ] && echo "$expired_list_out" | grep -qi "session expired"; then
+        record_test "Authenticated client command rejects expired session" "PASS"
+    else
+        error "list-files did not reject an expired client session"
+        record_test "Authenticated client command rejects expired session" "FAIL"
+    fi
+
     scenario "Verifying list-files --raw API privacy"
     local list_raw_output list_raw_exit_code
     safe_exec list_raw_output list_raw_exit_code \
         $CLIENT --server-url "$SERVER_URL" --tls-insecure list-files --raw
         
-    if echo "$list_raw_output" | grep -q "$UPLOADED_FILE_SHA256" || echo "$list_raw_output" | grep -q "test_file.bin"; then
+    if echo "$list_raw_output" | jq -e '.files[] | select(.encrypted_filename != null and .encrypted_filename != "")' >/dev/null 2>&1 \
+        && ! echo "$list_raw_output" | jq -e '.files[] | select(.filename != null)' >/dev/null 2>&1 \
+        && ! echo "$list_raw_output" | grep -q "$UPLOADED_FILE_SHA256" \
+        && ! echo "$list_raw_output" | grep -q "test_file.bin"; then
+        record_test "Raw List API Privacy" "PASS"
+    else
         error "Security failure: Raw API list exposed plaintext filename or hashes!"
         record_test "Raw List API Privacy" "FAIL"
-    else
-        record_test "Raw List API Privacy" "PASS"
     fi
     scenario "Downloading file (decryption handled by arkfile-client)"
     local downloaded_file="$TEST_DATA_DIR/downloaded.bin"
@@ -1507,10 +1622,8 @@ run_files_standard() {
         record_test "Extra file C upload (1MB)" "FAIL"
     fi
     rm -f "$extra_file_c"
-    # Exercises the new sequential multi-file upload path introduced in
-    # docs/wip/general-enhancements.md item 10. File sizes span the
-# MB PlaintextChunkSize boundary to exercise both full-chunk and
-    # partial-last-chunk paths.
+    # Exercises sequential multi-file upload. File sizes span the plaintext
+    # chunk-size boundary to cover both full-chunk and partial-last-chunk paths.
     scenario "Multi-file batch upload (3 x 16-18 MB)"
     local batch_file_a="$TEST_DATA_DIR/batch_a.bin"
     local batch_file_b="$TEST_DATA_DIR/batch_b.bin"
@@ -1615,11 +1728,11 @@ run_shares() {
     local SHARE_C_ID=""
 
     if [ -z "$UPLOADED_FILE_ID" ]; then
-        error "Missing file ID from Phase 8"
-        record_test "Phase 8 file data available" "FAIL"
+        error "Missing uploaded file ID from files_standard group"
+        record_test "Prior upload file ID available for shares" "FAIL"
     fi
-    record_test "Phase 8 file data available" "PASS"
-    info "Using file from Phase 8: File ID=$UPLOADED_FILE_ID"
+    record_test "Prior upload file ID available for shares" "PASS"
+    info "Using uploaded file for shares: File ID=$UPLOADED_FILE_ID"
     scenario "Create share without limits"
 
     local create_a_output create_a_exit_code
@@ -1681,6 +1794,26 @@ run_shares() {
         error "Share C creation failed:"; echo "$create_c_output"
         record_test "Share C creation (expires_after=1m)" "FAIL"
     fi
+    # Share C expiry: run immediately after create — expires_at is 1m from creation.
+    scenario "Visitor share expiry enforcement"
+
+    local dl_c1_file="$TEST_DATA_DIR/share_c_dl1.bin"
+    share_download_with_password "$SHARE_C_PASSWORD" "$SHARE_C_ID" "$dl_c1_file" "Share C download before expiry" "false"
+    rm -f "$dl_c1_file"
+
+    local now_ts
+    now_ts=$(date +%s)
+    local expiry_ts=$((SHARE_C_CREATED_AT + 60 + 5))
+    local wait_seconds=$((expiry_ts - now_ts))
+    if [ $wait_seconds -lt 0 ]; then
+        wait_seconds=0
+    fi
+    info "Smart sleep: waiting ${wait_seconds}s for Share C to expire..."
+    sleep "$wait_seconds"
+
+    local dl_c2_file="$TEST_DATA_DIR/share_c_dl2.bin"
+    share_download_with_password "$SHARE_C_PASSWORD" "$SHARE_C_ID" "$dl_c2_file" "Share C download after expiry rejected" "true"
+    assert_output_file_absent_or_empty "$dl_c2_file" "Share C rejected file hygiene"
     # CLI stdin order for a custom-file share: custom password first, share password second
     scenario "Create share from custom-password file"
 
@@ -1767,12 +1900,14 @@ run_shares() {
     safe_exec list_shares_raw_output list_shares_raw_exit_code \
         $CLIENT --server-url "$SERVER_URL" --tls-insecure share list --raw
         
-    # Raw GET /api/shares must not expose plaintext filenames for either share type
     if echo "$list_shares_raw_output" | grep -q "test_file.bin" || echo "$list_shares_raw_output" | grep -q "custom_test_file.bin"; then
         error "Security failure: Raw shares API list exposed plaintext filename!"
         record_test "Raw Shares API Privacy" "FAIL"
-    else
+    elif echo "$list_shares_raw_output" | jq -e '.shares[] | select(.share_id != null and .file_id != null)' >/dev/null 2>&1; then
         record_test "Raw Shares API Privacy" "PASS"
+    else
+        error "Security failure: Raw shares API missing expected share metadata!"
+        record_test "Raw Shares API Privacy" "FAIL"
     fi
     scenario "Unapprove user blocks session; re-approve restores access"
 
@@ -1829,6 +1964,77 @@ run_shares() {
     # Verify SHA256
     assert_sha256_matches "$dl_a_file" "$UPLOADED_FILE_SHA256" "Share A SHA256 integrity"
     rm -f "$dl_a_file"
+
+    scenario "Share download ticket endpoint validation"
+    # The ticket issuance endpoint (/api/public/shares/:id/ticket) replaces the
+    # never-rotated static download token as the per-chunk credential. These
+    # anonymous curl checks (no login) confirm the endpoint exists, requires a
+    # download_token, and rejects a garbage token with 403 rather than leaking
+    # state via 404/500.
+    #
+    # ORDERING NOTE: this scenario MUST run before the "Share enumeration rate
+    # limiting" sub-test below (and before invalid-token probes, which now run
+    # immediately after non-existent share download). ShareEnumerationMiddleware
+    # keys on the loopback test entity and blocks the entire /api/public/shares/*
+    # namespace once ~4 unique 404s accumulate in a 10-minute window. Running
+    # handler probes after the enumeration flood would receive 429 from the
+    # guard instead of the real 400/403/404 from the handler, masking the
+    # behavior under test. Here the entity is clean (only successful downloads
+    # so far), so the handler responses are genuine. We also keep to a single
+    # unknown-share probe so we add only one unique 404 to the entity's counter
+    # before the invalid-token and enumeration sub-tests begin.
+    if [ -n "$SHARE_A_ID" ]; then
+        local ticket_ep="${SERVER_URL}/api/public/shares/${SHARE_A_ID}/ticket"
+
+        # Empty token -> 400 Bad Request.
+        local empty_code
+        empty_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"download_token":""}' "$ticket_ep" 2>/dev/null)
+        if [ "$empty_code" = "400" ]; then
+            record_test "Ticket endpoint rejects empty token (HTTP 400)" "PASS"
+            info "Ticket endpoint empty-token -> 400 (expected)"
+        else
+            record_test "Ticket endpoint rejects empty token (HTTP $empty_code)" "FAIL"
+            warning "Expected 400 for empty token, got $empty_code"
+        fi
+
+        # Garbage token -> 403 Forbidden (NOT 404/500, which would leak state).
+        # A bad token does NOT record a share-enumeration 404 hit, so this probe
+        # does not advance the enumeration counter.
+        local bad_code
+        bad_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"download_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}' \
+            "$ticket_ep" 2>/dev/null)
+        if [ "$bad_code" = "403" ]; then
+            record_test "Ticket endpoint rejects bad token (HTTP 403)" "PASS"
+            info "Ticket endpoint garbage-token -> 403 (expected, no state leak)"
+        else
+            record_test "Ticket endpoint rejects bad token (HTTP $bad_code)" "FAIL"
+            warning "Expected 403 for bad token, got $bad_code"
+        fi
+
+        # Non-existent share ID -> 404 NotFound (and must NOT be a 500). This is
+        # the single unique 404 this scenario contributes to the entity counter.
+        local fake_id
+        fake_id="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | head -c 43)"
+        local nf_code
+        nf_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+            -X POST -H 'Content-Type: application/json' \
+            -d '{"download_token":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}' \
+            "${SERVER_URL}/api/public/shares/${fake_id}/ticket" 2>/dev/null)
+        if [ "$nf_code" = "404" ]; then
+            record_test "Ticket endpoint unknown share -> 404" "PASS"
+            info "Ticket endpoint unknown share -> 404 (expected)"
+        else
+            record_test "Ticket endpoint unknown share -> HTTP $nf_code" "FAIL"
+            warning "Expected 404 for unknown share, got $nf_code"
+        fi
+    else
+        error "Share A ID not available for ticket endpoint validation"
+        record_test "Share download ticket endpoint validation" "FAIL"
+    fi
     scenario "Visitor downloads custom-password share"
 
     sleep 2 # Rate limit buffer
@@ -1866,119 +2072,148 @@ run_shares() {
     local dl_b3_file="$TEST_DATA_DIR/share_b_dl3.bin"
     share_download_with_password "$SHARE_B_PASSWORD" "$SHARE_B_ID" "$dl_b3_file" "Share B download 3 rejected (max_accesses)" "true"
     assert_output_file_absent_or_empty "$dl_b3_file" "Share B rejected file hygiene"
-    scenario "Visitor share expiry enforcement"
-
-    # Download before expiry - should succeed
-    local dl_c1_file="$TEST_DATA_DIR/share_c_dl1.bin"
-    share_download_with_password "$SHARE_C_PASSWORD" "$SHARE_C_ID" "$dl_c1_file" "Share C download before expiry" "false"
-    rm -f "$dl_c1_file"
-
-    # Smart sleep: wait only the remaining time until 1 min after creation + 5s buffer
-    local now_ts
-    now_ts=$(date +%s)
-    local expiry_ts=$((SHARE_C_CREATED_AT + 60 + 5))
-    local wait_seconds=$((expiry_ts - now_ts))
-    if [ $wait_seconds -lt 0 ]; then
-        wait_seconds=0
-    fi
-    info "Smart sleep: waiting ${wait_seconds}s for Share C to expire..."
-    sleep "$wait_seconds"
-
-    # Download after expiry - should FAIL
-    local dl_c2_file="$TEST_DATA_DIR/share_c_dl2.bin"
-    share_download_with_password "$SHARE_C_PASSWORD" "$SHARE_C_ID" "$dl_c2_file" "Share C download after expiry rejected" "true"
-    assert_output_file_absent_or_empty "$dl_c2_file" "Share C rejected file hygiene"
     scenario "Non-existent share download fails"
 
     sleep 2  # Rate limit buffer
 
     share_download_with_password "$DUMMY_SHARE_PASSWORD" "$NONEXISTENT_SHARE_ID" "$TEST_DATA_DIR/nonexistent.bin" "Non-existent share rejection" "true"
     assert_output_file_absent_or_empty "$TEST_DATA_DIR/nonexistent.bin" "Non-existent share file hygiene"
-    # Hit 4 unique fake share IDs via curl to trigger the 5-second delay threshold.
-    # The enumeration guard tracks unique 404s per entity in a 10-minute window.
-    # After 4 unique 404s, subsequent requests should be delayed (HTTP 429).
-    scenario "Share enumeration rate limiting"
+    # ORDERING NOTE: invalid-download-token rate limiting MUST run before
+    # "Share enumeration rate limiting" below. ShareEnumerationMiddleware blocks
+    # the entire /api/public/shares/* namespace once ~4 unique 404s accumulate;
+    # running these probes after that flood would get 429 from the enumeration
+    # guard instead of 403/429 from the per-share token limiter.
+    #
+    # Contract: the static download_token is accepted only at ticket issuance
+    # (POST .../ticket). Chunk downloads require X-Share-Ticket; a missing
+    # ticket is 403 without recording a per-share failure. Probe bad tokens on
+    # the ticket endpoint of a non-exhausted share whose failure counter was
+    # not already advanced (Share D). Share A already recorded one bad-token
+    # failure in ticket-endpoint validation; Share B is exhausted.
+    scenario "Invalid download token rate limiting (ticket issuance)"
 
-    # Generate 4 unique fake 43-char base64url share IDs (matching expected format)
-    local FAKE_IDS=()
-    for i in 1 2 3 4; do
-        FAKE_IDS+=("$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | head -c 43)")
-    done
-
-    # Hit the first 3 (should return 404 quickly, no penalty)
-    for i in 0 1 2; do
-        local enum_code
-        enum_code=$(curl -sk -o /dev/null -w '%{http_code}' \
-            "${SERVER_URL}/api/public/shares/${FAKE_IDS[$i]}/envelope" 2>/dev/null)
-        if [ "$enum_code" = "404" ]; then
-            info "Enumeration probe $((i+1))/4: 404 (expected)"
-        else
-            warning "Enumeration probe $((i+1))/4: unexpected HTTP $enum_code"
-        fi
-    done
-
-    # Hit the 4th unique fake ID (this crosses the threshold and sets penalty,
-    # but the 4th request itself still gets 404 -- the block applies to the NEXT request)
-    local enum_code_4
-    enum_code_4=$(curl -sk -o /dev/null -w '%{http_code}' \
-        "${SERVER_URL}/api/public/shares/${FAKE_IDS[3]}/envelope" 2>/dev/null)
-    if [ "$enum_code_4" = "404" ]; then
-        info "Enumeration probe 4/4: 404 (threshold crossed, penalty now active)"
-        record_test "Share enumeration threshold (4 unique 404s recorded)" "PASS"
-    else
-        warning "Enumeration probe 4/4: unexpected HTTP $enum_code_4"
-        record_test "Share enumeration threshold (4 unique 404s recorded)" "PASS"
-    fi
-
-    # 5th probe: NOW the enumeration guard should block with 429
-    local enum_code_5
-    enum_code_5=$(curl -sk -o /dev/null -w '%{http_code}' \
-        "${SERVER_URL}/api/public/shares/${FAKE_IDS[0]}/envelope" 2>/dev/null)
-    if [ "$enum_code_5" = "429" ]; then
-        record_test "Share enumeration rate limiting (HTTP 429 after threshold)" "PASS"
-        info "Enumeration guard returned 429 on 5th probe after 4 unique 404s"
-    else
-        record_test "Share enumeration rate limiting (HTTP 429 after threshold)" "FAIL"
-        error "Expected 429 on 5th probe after enumeration penalty, got HTTP $enum_code_5"
-    fi
-    # Use a valid share ID (Share B) with a deliberately bad download token.
-    # The per-share-ID rate limiter should record failures and eventually return 429.
-    scenario "Invalid download token rate limiting"
-
-    if [ -n "$SHARE_B_ID" ]; then
+    if [ -n "$SHARE_D_ID" ]; then
         local BAD_TOKEN
         BAD_TOKEN=$(echo "deliberately-wrong-token-value" | base64)
+        local ticket_rl_ep="${SERVER_URL}/api/public/shares/${SHARE_D_ID}/ticket"
 
-        # Send 4 requests with bad token to trigger progressive penalty
+        # Missing ticket on chunks: fail closed with 403, no rate-limit counter.
+        local missing_ticket_code
+        missing_ticket_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "${SERVER_URL}/api/public/shares/${SHARE_D_ID}/chunks/0" 2>/dev/null)
+        if [ "$missing_ticket_code" = "403" ]; then
+            record_test "Chunk download without X-Share-Ticket returns 403" "PASS"
+            info "Missing share ticket on chunk -> 403 (expected; does not arm per-share limiter)"
+        else
+            record_test "Chunk download without X-Share-Ticket returns 403" "FAIL"
+            warning "Expected 403 for missing ticket, got $missing_ticket_code"
+        fi
+
+        local token_fail=0
         for i in 1 2 3 4; do
             local token_code
             token_code=$(curl -sk -o /dev/null -w '%{http_code}' \
-                -H "X-Download-Token: $BAD_TOKEN" \
-                "${SERVER_URL}/api/public/shares/${SHARE_B_ID}/chunks/0" 2>/dev/null)
-            if [ "$token_code" = "403" ] || [ "$token_code" = "429" ]; then
-                info "Invalid token attempt $i/4: HTTP $token_code"
+                -X POST -H 'Content-Type: application/json' \
+                -d "{\"download_token\":\"${BAD_TOKEN}\"}" \
+                "$ticket_rl_ep" 2>/dev/null)
+            if [ "$token_code" = "403" ]; then
+                info "Invalid ticket-token attempt $i/4: HTTP $token_code"
             else
-                warning "Invalid token attempt $i/4: unexpected HTTP $token_code"
+                warning "Invalid ticket-token attempt $i/4: expected HTTP 403, got $token_code"
+                token_fail=1
             fi
         done
 
-        # 5th attempt should be rate limited (429)
+        if [ "$token_fail" -eq 0 ]; then
+            record_test "Invalid download token attempts 1-4 return 403" "PASS"
+        else
+            record_test "Invalid download token attempts 1-4 return 403" "FAIL"
+        fi
+
+        # 4th failure arms a 30s penalty; 5th request should be rate limited (429).
         sleep 1
         local token_code_5
         token_code_5=$(curl -sk -o /dev/null -w '%{http_code}' \
-            -H "X-Download-Token: $BAD_TOKEN" \
-            "${SERVER_URL}/api/public/shares/${SHARE_B_ID}/chunks/0" 2>/dev/null)
+            -X POST -H 'Content-Type: application/json' \
+            -d "{\"download_token\":\"${BAD_TOKEN}\"}" \
+            "$ticket_rl_ep" 2>/dev/null)
         if [ "$token_code_5" = "429" ]; then
             record_test "Invalid download token rate limiting (HTTP 429 after failures)" "PASS"
-            info "Per-share rate limiter returned 429 after repeated invalid tokens"
+            info "Per-share rate limiter returned 429 after repeated invalid ticket tokens"
         else
-            # The rate limiter applies progressive delays; 403 with delay is also acceptable
-            record_test "Invalid download token rate limiting (HTTP $token_code_5)" "PASS"
-            warning "Per-share rate limiter returned HTTP $token_code_5 (429 expected but delay may be applied instead)"
+            record_test "Invalid download token rate limiting (HTTP 429 after failures)" "FAIL"
+            error "Per-share rate limiter returned HTTP $token_code_5 (expected 429)"
         fi
     else
-        warning "Share B ID not available, skipping invalid download token test"
-        record_test "Invalid download token rate limiting" "SKIP"
+        error "Share D ID not available for invalid download token test"
+        record_test "Invalid download token rate limiting" "FAIL"
+    fi
+    # Hit unique fake share IDs via curl to trigger the enumeration threshold.
+    # The enumeration guard tracks unique 404s per entity in a 10-minute window
+    # and blocks (429) after ~4 unique 404s. Earlier sub-tests (Non-existent
+    # share download, ticket endpoint unknown-share probe, and the timing-floor
+    # probe below) may already have added a few unique 404s to the entity's
+    # counter, so we do NOT assume a pristine counter. Instead we probe fresh
+    # unique IDs until the guard returns 429 (or we hit a safety cap), which
+    # proves the enumeration guard is active regardless of starting state.
+    scenario "Share enumeration rate limiting"
+
+    # Timing-protection regression: a 404 on the public share envelope endpoint
+    # MUST be padded to the 1-second minimum so a fast 404 does not leak share-ID
+    # existence at line rate. Use a fresh fake ID so this measurement is not
+    # served from cache. Anonymous curl, no login cycle. (This probe also adds
+    # one unique 404 to the entity's enumeration counter, which the loop below
+    # tolerates.)
+    scenario "Share envelope timing protection floor"
+    local timing_id
+    timing_id="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | head -c 43)"
+    local timing_start timing_end timing_elapsed
+    timing_start=$(date +%s%N)
+    local timing_code
+    timing_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+        "${SERVER_URL}/api/public/shares/${timing_id}/envelope" 2>/dev/null)
+    timing_end=$(date +%s%N)
+    timing_elapsed_ms=$(( (timing_end - timing_start) / 1000000 ))
+    if [ "$timing_code" = "404" ] && [ "$timing_elapsed_ms" -ge 1000 ]; then
+        record_test "Share envelope 404 padded to >=1s (elapsed ${timing_elapsed_ms}ms)" "PASS"
+        info "Envelope 404 padded: ${timing_elapsed_ms}ms (HTTP $timing_code)"
+    else
+        record_test "Share envelope 404 padded to >=1s (elapsed ${timing_elapsed_ms}ms, code $timing_code)" "FAIL"
+        warning "Expected padded 404 >=1000ms, got ${timing_elapsed_ms}ms (HTTP $timing_code)"
+    fi
+
+    # Probe fresh unique share IDs until the enumeration guard blocks (429) or
+    # we exceed a safety cap. The guard blocks after ~4 unique 404s in a
+    # 10-minute window; with a handful of prior 404s already counted, this
+    # typically triggers within the first few probes.
+    local enum_blocked=0
+    local enum_probes=0
+    local enum_max_probes=12
+    while [ "$enum_probes" -lt "$enum_max_probes" ]; do
+        enum_probes=$((enum_probes + 1))
+        local enum_id enum_code
+        enum_id="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=' | head -c 43)"
+        enum_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+            "${SERVER_URL}/api/public/shares/${enum_id}/envelope" 2>/dev/null)
+        if [ "$enum_code" = "429" ]; then
+            enum_blocked=1
+            info "Enumeration guard returned 429 on probe ${enum_probes} (unique-404 threshold reached)"
+            break
+        elif [ "$enum_code" = "404" ]; then
+            info "Enumeration probe ${enum_probes}: 404 (counting toward threshold)"
+        else
+            warning "Enumeration probe ${enum_probes}: unexpected HTTP $enum_code"
+        fi
+    done
+
+    if [ "$enum_blocked" = "1" ]; then
+        record_test "Share enumeration threshold (429 after unique 404s)" "PASS"
+        record_test "Share enumeration rate limiting (HTTP 429 after threshold)" "PASS"
+        info "Enumeration guard returned 429 after ${enum_probes} unique-404 probes"
+    else
+        record_test "Share enumeration threshold (429 after unique 404s)" "FAIL"
+        record_test "Share enumeration rate limiting (HTTP 429 after threshold)" "FAIL"
+        error "Enumeration guard did not return 429 after ${enum_max_probes} unique-404 probes"
     fi
     scenario "Re-authenticate to revoke share"
     user_login_with_totp "Re-authentication for revoke"
@@ -2140,17 +2375,12 @@ run_shares() {
     if [ ! -f "$HOME/.arkfile-session.json" ]; then
         record_test "Session file cleared after revoke-all" "PASS"
     else
-        warning "Session file still exists after revoke-all (unexpected)"
-        record_test "Session file cleared after revoke-all" "PASS"
+        error "Session file still exists after revoke-all (expected removal)"
+        record_test "Session file cleared after revoke-all" "FAIL"
     fi
 
-    # Re-login so the CLI session is fresh for the 10.23 logout step and
-    # the post-logout rejection checks that follow.
+    # Re-login so the CLI session is fresh for the post-logout rejection checks.
     user_login_with_totp "User re-login after self-revoke test"
-    E2E_REVOCATION_TEST_TOKEN=""
-    if [ -f "$HOME/.arkfile-session.json" ]; then
-        E2E_REVOCATION_TEST_TOKEN=$(jq -r '.access_token // empty' "$HOME/.arkfile-session.json" 2>/dev/null)
-    fi
     scenario "User logout and post-logout command rejection"
     logout_user_session "User logout (post-revoke)"
 
@@ -2248,6 +2478,37 @@ run_admin_operations() {
     else
         record_test "Admin system-status storage size non-zero" "PASS"
     fi
+
+    scenario "Admin health-check (no placeholder disk metrics)"
+    local health_out health_code
+    safe_exec health_out health_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure health-check --detailed
+    if [ $health_code -eq 0 ] \
+        && ! echo "$health_out" | grep -qi "disk" \
+        && echo "$health_out" | grep -qi "healthy"; then
+        record_test "Admin health-check --detailed (no disk placeholders)" "PASS"
+    else
+        error "health-check --detailed failed or contained disk section"
+        echo "$health_out"
+        record_test "Admin health-check --detailed (no disk placeholders)" "FAIL"
+    fi
+
+    scenario "Admin contacts API contract"
+    local contacts_body contacts_code
+    contacts_body=$(curl -sk -w '\n%{http_code}' "${SERVER_URL}/api/admin-contacts" 2>/dev/null || echo -e '\n000')
+    contacts_code=$(echo "$contacts_body" | tail -n1)
+    contacts_body=$(echo "$contacts_body" | sed '$d')
+    if [ "$contacts_code" = "200" ] \
+        && echo "$contacts_body" | jq -e '.configured == true' >/dev/null 2>&1 \
+        && ! echo "$contacts_body" | grep -q "admin@example.com" \
+        && ! echo "$contacts_body" | grep -q "default-admin"; then
+        record_test "Admin contacts API (configured, no fake defaults)" "PASS"
+    else
+        error "Admin contacts API contract failed"
+        echo "$contacts_body"
+        record_test "Admin contacts API (configured, no fake defaults)" "FAIL"
+    fi
+
     scenario "Admin reads user contact info"
     local admin_ci_output admin_ci_code
     safe_exec admin_ci_output admin_ci_code \
@@ -2354,6 +2615,29 @@ run_admin_operations() {
         echo "$update_user_output"
         record_test "Admin update-user" "FAIL"
     fi
+    scenario "Establish active user JWT before admin MFA reset"
+    user_login_with_totp "User login before admin MFA reset"
+    local pre_reset_access_token
+    if ! pre_reset_access_token=$(jq -r '.access_token // empty' "$HOME/.arkfile-session.json" 2>/dev/null); then
+        pre_reset_access_token=""
+    fi
+    if [ -z "$pre_reset_access_token" ]; then
+        error "Could not extract an access token before admin MFA reset"
+        record_test "MFA reset JWT revocation prerequisite" "FAIL"
+    fi
+
+    local pre_reset_http pre_reset_code
+    safe_exec pre_reset_http pre_reset_code \
+        curl -skS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${pre_reset_access_token}" \
+        "${SERVER_URL}/api/files"
+    if [ $pre_reset_code -eq 0 ] && [ "$pre_reset_http" = "200" ]; then
+        record_test "JWT valid immediately before admin MFA reset" "PASS"
+    else
+        error "Expected HTTP 200 before admin MFA reset, got HTTP $pre_reset_http"
+        record_test "JWT valid immediately before admin MFA reset" "FAIL"
+    fi
+
     scenario "Admin reset-user-mfa"
     local reset_mfa_output reset_mfa_code
     safe_exec reset_mfa_output reset_mfa_code \
@@ -2368,29 +2652,18 @@ run_admin_operations() {
         echo "$reset_mfa_output"
         record_test "Admin reset-user-mfa" "FAIL"
     fi
-    # After admin MFA reset the test user's JWT revocation is written to
-    # revoked_tokens. Any subsequent request using an old JWT must be
-    # rejected with 401 by TokenRevocationMiddleware.
     scenario "Per-request user-wide revocation check"
-    local old_access_token="${E2E_REVOCATION_TEST_TOKEN:-}"
-    if [ -n "$old_access_token" ]; then
-        # Allow up to 35 seconds for the 30-second in-process cache to expire
-        info "Waiting 35s for revocation cache to expire before verifying..."
-        sleep 35
-        local revoke_check_resp
-        revoke_check_resp=$(curl -sk -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${old_access_token}" \
-            "${SERVER_URL}/api/files" 2>/dev/null)
-        if [ "$revoke_check_resp" = "401" ]; then
-            record_test "MFA reset: per-request revocation rejects old JWT" "PASS"
-            info "Old JWT correctly rejected with 401 after MFA reset"
-        else
-            error "Expected 401 on old JWT after MFA reset, got HTTP $revoke_check_resp"
-            record_test "MFA reset: per-request revocation rejects old JWT" "FAIL"
-        fi
+    local revoke_check_http revoke_check_code
+    safe_exec revoke_check_http revoke_check_code \
+        curl -skS -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${pre_reset_access_token}" \
+        "${SERVER_URL}/api/files"
+    if [ $revoke_check_code -eq 0 ] && [ "$revoke_check_http" = "401" ]; then
+        record_test "MFA reset immediately revokes active JWT" "PASS"
+        info "Active JWT rejected immediately after MFA reset"
     else
-        warning "No stashed access token for revocation replay; skipping e2e test"
-        record_test "MFA reset: per-request revocation rejects old JWT" "PASS"
+        error "Expected HTTP 401 immediately after MFA reset, got HTTP $revoke_check_http"
+        record_test "MFA reset immediately revokes active JWT" "FAIL"
     fi
     scenario "Admin revoke-share"
     if [ -n "$SHARE_D_ID" ]; then
@@ -2407,8 +2680,8 @@ run_admin_operations() {
             record_test "Admin revoke-share" "FAIL"
         fi
     else
-        info "Skipping revoke-share test (SHARE_D_ID not set)"
-        record_test "Admin revoke-share" "SKIP"
+        error "SHARE_D_ID not set for admin revoke-share test"
+        record_test "Admin revoke-share" "FAIL"
     fi
     scenario "Admin delete-file"
     if [ -n "$CUSTOM_FILE_ID" ]; then
@@ -2425,8 +2698,8 @@ run_admin_operations() {
             record_test "Admin delete-file" "FAIL"
         fi
     else
-        info "Skipping delete-file test (CUSTOM_FILE_ID not set)"
-        record_test "Admin delete-file" "SKIP"
+        error "CUSTOM_FILE_ID not set for admin delete-file test"
+        record_test "Admin delete-file" "FAIL"
     fi
 
     # NOTE: admin delete-user is NOT tested here because e2e-playwright.sh
@@ -2442,12 +2715,22 @@ run_security_rate_limits() {
     group "Security rate limits"
 
     local FLOOD_UA="arkfile-flood-test-scanner"
+    # Isolate this test's entity ID from other curl probes. The entity ID is
+    # HMAC(key, "anon:" + IP + "|" + uaBucket + "|" + langBucket). On loopback
+    # the IP is fixed, and the custom UA above collapses into the "other" UA
+    # bucket (shared with curl's own UA), so the only remaining axis we control
+    # is the Accept-Language bucket. A distinct primary language ("xx") yields a
+    # distinct langBucket, giving this test a fresh flood-guard counter that
+    # other UA-less curl probes in the suite do not pollute. See
+    # logging/entity_id.go acceptLanguageBucket.
+    local FLOOD_LANG="xx"
     scenario "Unauthenticated probes under threshold"
     local all_under_threshold=true
     for i in $(seq 1 9); do
         local probe_code
         probe_code=$(curl -sk -o /dev/null -w '%{http_code}' \
             -H "User-Agent: $FLOOD_UA" \
+            -H "Accept-Language: $FLOOD_LANG" \
             "${SERVER_URL}/wp-scan-${i}.php" 2>/dev/null)
         if [ "$probe_code" = "429" ]; then
             all_under_threshold=false
@@ -2463,6 +2746,7 @@ run_security_rate_limits() {
     local probe_10_code
     probe_10_code=$(curl -sk -o /dev/null -w '%{http_code}' \
         -H "User-Agent: $FLOOD_UA" \
+        -H "Accept-Language: $FLOOD_LANG" \
         "${SERVER_URL}/wp-scan-10.php" 2>/dev/null)
     info "Probe 10: HTTP $probe_10_code"
     # The 10th request itself may or may not get 429 (depends on whether the middleware
@@ -2471,6 +2755,7 @@ run_security_rate_limits() {
     local probe_11_code probe_11_headers
     probe_11_headers=$(curl -sk -D - -o /dev/null \
         -H "User-Agent: $FLOOD_UA" \
+        -H "Accept-Language: $FLOOD_LANG" \
         "${SERVER_URL}/wp-scan-11.php" 2>/dev/null)
     probe_11_code=$(echo "$probe_11_headers" | head -1 | awk '{print $2}')
 
@@ -2501,18 +2786,9 @@ run_security_rate_limits() {
         record_test "Flood guard: security event recorded (unauthorized_flood)" "PASS"
         info "Admin can see flood guard event in security-events"
     else
-        # Also check endpoint_abuse in case the threshold was high enough
-        safe_exec sec_flood_output sec_flood_code \
-            $ADMIN --server-url "$SERVER_URL" --tls-insecure \
-            security-events --type endpoint_abuse --json
-        if [ $sec_flood_code -eq 0 ] && echo "$sec_flood_output" | grep -q "unauthorized_flood"; then
-            record_test "Flood guard: security event recorded (unauthorized_flood)" "PASS"
-            info "Admin can see flood guard event in security-events (endpoint_abuse)"
-        else
-            error "Flood guard security event not found in admin security-events"
-            echo "$sec_flood_output"
-            record_test "Flood guard: security event recorded (unauthorized_flood)" "FAIL"
-        fi
+        error "Flood guard security event not found in admin security-events (suspicious_pattern)"
+        echo "$sec_flood_output"
+        record_test "Flood guard: security event recorded (unauthorized_flood)" "FAIL"
     fi
 
     success "Security rate limits complete"
@@ -2562,16 +2838,28 @@ run_storage_replication() {
         record_test "Multi-backend: storage-status shows both providers" "FAIL"
     fi
 
-    # Verify secondary has 0 files initially
-    if echo "$ss_output" | grep -A5 "seaweedfs-secondary" | grep -q "Files:.*0"; then
+    # Verify secondary has 0 files initially (JSON avoids brittle human-output parsing).
+    local ss_json ss_json_code secondary_objects
+    safe_exec ss_json ss_json_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure storage-status --json
+    secondary_objects=$(echo "$ss_json" | jq -r \
+        '.providers[]? | select(.provider_id == "seaweedfs-secondary") | .total_objects // empty' \
+        2>/dev/null)
+    if [ $ss_json_code -eq 0 ] && [ "$secondary_objects" = "0" ]; then
         record_test "Multi-backend: secondary starts with 0 files" "PASS"
     else
-        warning "Secondary may already have files (ok if re-running without dev-reset)"
-        record_test "Multi-backend: secondary starts with 0 files" "PASS"
+        error "Secondary seaweedfs-secondary total_objects is not 0 (run dev-reset before e2e):"
+        if [ $ss_json_code -eq 0 ]; then
+            echo "$ss_json" | jq '.providers[]? | select(.provider_id == "seaweedfs-secondary")' 2>/dev/null \
+                || echo "$ss_json"
+        else
+            echo "$ss_json"
+        fi
+        record_test "Multi-backend: secondary starts with 0 files" "FAIL"
     fi
     scenario "Copy single file to secondary storage"
     if [ -z "$EXTRA_FILE_C_ID" ]; then
-        error "EXTRA_FILE_C_ID not set (Phase 8.15 did not complete)"
+        error "EXTRA_FILE_C_ID not set (extra 1MB upload in files_standard did not complete)"
         record_test "Multi-backend: copy-file single file" "FAIL"
     fi
 
@@ -2636,8 +2924,9 @@ run_storage_replication() {
                 if echo "$ca_poll_output" | grep -q "Skipped: 1"; then
                     record_test "Multi-backend: copy-all skipped existing" "PASS"
                 else
-                    warning "copy-all did not report Skipped: 1 (may vary if re-running)"
-                    record_test "Multi-backend: copy-all skipped existing" "PASS"
+                    error "copy-all did not report Skipped: 1:"
+                    echo "$ca_poll_output"
+                    record_test "Multi-backend: copy-all skipped existing" "FAIL"
                 fi
                 record_test "Multi-backend: copy-all completed" "PASS"
             else
@@ -2858,17 +3147,32 @@ run_billing() {
     local setprice_out setprice_code
     safe_exec setprice_out setprice_code \
         $ADMIN --server-url "$SERVER_URL" --tls-insecure \
-        billing set-price 19.99
+        billing set-price --json 19.99
 
-    if [ $setprice_code -eq 0 ] \
-        && echo "$setprice_out" | grep -qE "2711|microcents" ; then
-        record_test "set-price 19.99 updates to 2711 microcents/GiB/hour" "PASS"
+    local setprice_rate
+    setprice_rate=$(echo "$setprice_out" | jq -r '.microcents_per_gib_per_hour // empty' 2>/dev/null)
+    if [ $setprice_code -eq 0 ] && [ "$setprice_rate" = "2711" ]; then
+        record_test "set-price --json 19.99 updates to 2711 microcents/GiB/hour" "PASS"
         info "set-price output:"
         echo "$setprice_out"
     else
-        error "set-price 19.99 failed or did not show new rate"
+        error "set-price --json 19.99 failed or did not return microcents_per_gib_per_hour=2711"
         echo "$setprice_out"
-        record_test "set-price 19.99 updates to 2711 microcents/GiB/hour" "FAIL"
+        record_test "set-price --json 19.99 updates to 2711 microcents/GiB/hour" "FAIL"
+    fi
+
+    local setprice_trailing_out setprice_trailing_code setprice_trailing_rate
+    safe_exec setprice_trailing_out setprice_trailing_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing set-price 19.99 --json
+
+    setprice_trailing_rate=$(echo "$setprice_trailing_out" | jq -r '.microcents_per_gib_per_hour // empty' 2>/dev/null)
+    if [ $setprice_trailing_code -eq 0 ] && [ "$setprice_trailing_rate" = "2711" ]; then
+        record_test "set-price 19.99 --json accepts trailing --json flag" "PASS"
+    else
+        error "set-price 19.99 --json failed or did not return microcents_per_gib_per_hour=2711"
+        echo "$setprice_trailing_out"
+        record_test "set-price 19.99 --json accepts trailing --json flag" "FAIL"
     fi
 
     # Tick + sweep at the new price; the new usage row should reflect it.
@@ -2907,7 +3211,12 @@ run_billing() {
     # to the documented default after the loop exits.
     safe_exec _drain_sp_out _drain_sp_code \
         $ADMIN --server-url "$SERVER_URL" --tls-insecure \
-        billing set-price 9999.99 || true
+        billing set-price 9999.99
+    if [ $_drain_sp_code -ne 0 ]; then
+        error "Failed to set extreme price for balance drain test:"
+        echo "$_drain_sp_out"
+        record_test "Set extreme price for balance drain" "FAIL"
+    fi
 
     local max_sweeps=20
     local sweep_count=0
@@ -2917,7 +3226,12 @@ run_billing() {
     while [ "$sweep_count" -lt "$max_sweeps" ]; do
         safe_exec tick_out tick_code \
             $ADMIN --server-url "$SERVER_URL" --tls-insecure \
-            billing tick-now --sweep --json || true
+            billing tick-now --sweep --json
+        if [ $tick_code -ne 0 ]; then
+            error "tick-now --sweep failed during balance drain (sweep $((sweep_count + 1))):"
+            echo "$tick_out"
+            record_test "Balance drain tick-now --sweep" "FAIL"
+        fi
         sweep_count=$((sweep_count + 1))
 
         # Re-check balance
@@ -2960,7 +3274,12 @@ run_billing() {
     # Restore price to documented default after the drain test.
     safe_exec _restore_sp_out _restore_sp_code \
         $ADMIN --server-url "$SERVER_URL" --tls-insecure \
-        billing set-price 10.00 || true
+        billing set-price 10.00
+    if [ $_restore_sp_code -ne 0 ]; then
+        error "Failed to restore price to 10.00 after balance drain test:"
+        echo "$_restore_sp_out"
+        record_test "Restore price after balance drain" "FAIL"
+    fi
 
     info "Billing complete"
 }
@@ -3007,6 +3326,154 @@ run_payments() {
     else
         # Log in as the regular test user to ensure a fresh session and token
         user_login_with_totp "User login for payments test"
+    fi
+
+    # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    scenario "PAYG negative-balance upload cap"
+
+    # Billing (admin-only) leaves the test user slightly negative.  User CLI
+    # steps run here — after post-admin-reset MFA re-enrollment — so upload
+    # and download probes have a valid session.  Invoice top-up below restores
+    # balance afterward.
+    local cap_microcents=1000000000   # $10.00 in microcents
+    local cap_test_file="$TEST_DATA_DIR/payg_cap_probe.bin"
+    head -c 2048 /dev/urandom > "$cap_test_file" 2>/dev/null || \
+        printf 'x%.0s' $(seq 1 2048) > "$cap_test_file"
+
+    # --- Step 1: small negative balance does NOT block uploads ---------
+    local cap_small_out cap_small_code
+    safe_exec cap_small_out cap_small_code \
+        $CLIENT \
+        --server-url "$SERVER_URL" \
+        --tls-insecure \
+        upload \
+        --file "$cap_test_file" \
+        --password-type account
+
+    if [ $cap_small_code -eq 0 ] \
+        && ! echo "$cap_small_out" | grep -qi "payment_required" \
+        && ! echo "$cap_small_out" | grep -qi "HTTP 402"; then
+        record_test "Small negative balance does not block upload" "PASS"
+    else
+        error "Upload blocked or failed at small negative balance (within cap):"
+        echo "$cap_small_out"
+        record_test "Small negative balance does not block upload" "FAIL"
+    fi
+
+    # --- Step 2: drive balance below the -$10 cap ----------------------
+    # Each tick-now --sweep bills only one simulated hour (~5.5-7M µ¢ at
+    # dev storage + 999999.99 price). Batch tick-only calls fill the
+    # accumulator, then one sweep settles each round.
+    safe_exec _cap_sp_out _cap_sp_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing set-price 999999.99
+    if [ $_cap_sp_code -ne 0 ]; then
+        error "Failed to set extreme price for PAYG cap drain:"
+        echo "$_cap_sp_out"
+        record_test "Set extreme price for PAYG cap drain" "FAIL"
+    fi
+
+    local cap_drain_round=0
+    local cap_max_drain_rounds=5
+    local cap_ticks_per_round=150
+    local cap_balance
+    safe_exec credits_after_out credits_after_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing show --user "$TEST_USERNAME" --json
+    cap_balance=$(echo "$credits_after_out" | \
+        jq -r '.balance_usd_microcents // 0' 2>/dev/null || echo "0")
+    while [ "$cap_drain_round" -lt "$cap_max_drain_rounds" ]; do
+        if [ -n "$cap_balance" ] && [ "$cap_balance" -le "-$cap_microcents" ] 2>/dev/null; then
+            break
+        fi
+        local cap_tick_i
+        for cap_tick_i in $(seq 1 "$cap_ticks_per_round"); do
+            safe_exec tick_out tick_code \
+                $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+                billing tick-now --json
+            if [ $tick_code -ne 0 ]; then
+                error "tick-now failed during PAYG cap drain (round $((cap_drain_round + 1)), tick $cap_tick_i):"
+                echo "$tick_out"
+                record_test "PAYG cap drain tick-now" "FAIL"
+            fi
+        done
+        safe_exec tick_out tick_code \
+            $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+            billing tick-now --sweep --json
+        if [ $tick_code -ne 0 ]; then
+            error "tick-now --sweep failed during PAYG cap drain (round $((cap_drain_round + 1))):"
+            echo "$tick_out"
+            record_test "PAYG cap drain tick-now --sweep" "FAIL"
+        fi
+        cap_drain_round=$((cap_drain_round + 1))
+        safe_exec credits_after_out credits_after_code \
+            $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+            billing show --user "$TEST_USERNAME" --json
+        cap_balance=$(echo "$credits_after_out" | \
+            jq -r '.balance_usd_microcents // 0' 2>/dev/null || echo "0")
+    done
+    info "Balance after cap drain: $cap_balance microcents (target <= -$cap_microcents)"
+
+    if [ -n "$cap_balance" ] && [ "$cap_balance" -le "-$cap_microcents" ] 2>/dev/null; then
+        record_test "Balance driven to/below negative cap (-\$10)" "PASS"
+    else
+        error "Balance did not reach negative cap after $cap_drain_round drain round(s): $cap_balance"
+        record_test "Balance driven to/below negative cap (-\$10)" "FAIL"
+    fi
+
+    # --- Step 2b: upload now blocked at/under the cap ------------------
+    head -c 2048 /dev/urandom > "$cap_test_file" 2>/dev/null || \
+        printf 'y%.0s' $(seq 1 2048) > "$cap_test_file"
+    local cap_block_out cap_block_code
+    safe_exec cap_block_out cap_block_code \
+        $CLIENT \
+        --server-url "$SERVER_URL" \
+        --tls-insecure \
+        upload \
+        --file "$cap_test_file" \
+        --password-type account
+
+    if [ $cap_block_code -ne 0 ] \
+        && echo "$cap_block_out" | grep -qi "payment_required" \
+        && echo "$cap_block_out" | grep -qi "HTTP 402"; then
+        record_test "Upload blocked at negative cap (402 payment_required)" "PASS"
+        info "Blocked upload output:"
+        echo "$cap_block_out"
+    else
+        error "Upload was NOT blocked at negative cap (expected non-zero exit and 402 payment_required):"
+        echo "$cap_block_out"
+        record_test "Upload blocked at negative cap (402 payment_required)" "FAIL"
+    fi
+
+    # --- Step 3: download still works while at the cap -----------------
+    local cap_dl_file="$TEST_DATA_DIR/payg_cap_download.bin"
+    local cap_dl_out cap_dl_code
+    safe_exec cap_dl_out cap_dl_code \
+        $CLIENT \
+        --server-url "$SERVER_URL" \
+        --tls-insecure \
+        download \
+        --file-id "$UPLOADED_FILE_ID" \
+        --output "$cap_dl_file"
+
+    if [ $cap_dl_code -eq 0 ]; then
+        record_test "Download still works while at negative cap" "PASS"
+    else
+        error "Download failed while at negative cap:"
+        echo "$cap_dl_out"
+        record_test "Download still works while at negative cap" "FAIL"
+    fi
+
+    rm -f "$cap_test_file" "$cap_dl_file"
+
+    safe_exec _cap_restore_sp_out _cap_restore_sp_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing set-price 10.00
+    if [ $_cap_restore_sp_code -ne 0 ]; then
+        error "Failed to restore price to 10.00 after PAYG cap test:"
+        echo "$_cap_restore_sp_out"
+        record_test "Restore price after PAYG cap test" "FAIL"
     fi
 
     # Extract the token directly from the user's active session file
@@ -3062,9 +3529,9 @@ run_payments() {
     scenario "Simulate BTCPay webhook and verify credit"
 
     # Settle the invoice by sending a signed webhook payload to /api/webhooks/btcpay
-    # Payload format
+    local provider_invoice_id="btcpay_mock_${invoice_id}"
     local webhook_payload
-    webhook_payload='{"type":"InvoiceSettled","invoiceId":"test_provider_id","metadata":{"invoice_id":"'"$invoice_id"'"}}'
+    webhook_payload='{"type":"InvoiceSettled","storeId":"test_store_id","invoiceId":"'"$provider_invoice_id"'","metadata":{"invoice_id":"'"$invoice_id"'"}}'
     
     # Compute signature: hmac sha256 of payload with secret "test_webhook_secret"
     local signature
@@ -3154,6 +3621,617 @@ run_payments() {
     stop_mock_btcpay_server "$mock_pid"
 
     info "Payments complete"
+}
+
+start_mock_subscription_bridge() {
+    local e2e_script_dir="$1"
+    local go_bin="$2"
+    local mock_bin="$TEST_DATA_DIR/subscription-bridge-mock"
+    local mock_log="$TEST_DATA_DIR/subscription-bridge-mock.log"
+    local mock_src="$e2e_script_dir/subscription-bridge-mock.go"
+    local mock_pid
+
+    : > "$mock_log"
+    export SUBSCRIPTION_BRIDGE_PAIRING_ROOT="${SUBSCRIPTION_BRIDGE_PAIRING_ROOT:-000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f}"
+    export ARKFILE_WEBHOOK_URL="${SERVER_URL}/api/webhooks/subscription-bridge"
+
+    info "Building mock Subscription Bridge..."
+    if ! "$go_bin" build -o "$mock_bin" "$mock_src" >>"$mock_log" 2>&1; then
+        error "Failed to build mock Subscription Bridge"
+        cat "$mock_log"
+        return 1
+    fi
+
+    info "Starting mock Subscription Bridge on :8081..."
+    "$mock_bin" >>"$mock_log" 2>&1 &
+    mock_pid=$!
+
+    local i
+    for i in $(seq 1 60); do
+        if curl -s --connect-timeout 1 http://127.0.0.1:8081/health >/dev/null 2>&1; then
+            info "Mock Subscription Bridge is listening on :8081"
+            echo "$mock_pid"
+            return 0
+        fi
+        if ! kill -0 "$mock_pid" 2>/dev/null; then
+            error "Mock Subscription Bridge exited early"
+            cat "$mock_log"
+            return 1
+        fi
+        sleep 1
+    done
+    error "Mock Subscription Bridge did not become ready"
+    cat "$mock_log"
+    kill "$mock_pid" 2>/dev/null || true
+    return 1
+}
+
+stop_mock_subscription_bridge() {
+    local mock_pid="$1"
+    if [ -n "$mock_pid" ] && kill -0 "$mock_pid" 2>/dev/null; then
+        kill "$mock_pid" 2>/dev/null || true
+        wait "$mock_pid" 2>/dev/null || true
+    fi
+}
+
+user_access_token() {
+    jq -r '.access_token // empty' "$HOME/.arkfile-session.json" 2>/dev/null
+}
+
+ensure_user_session() {
+    local tok http_code
+    tok=$(user_access_token)
+    if [ -z "$tok" ]; then
+        user_login_with_totp "User login (subscriptions session missing)"
+        return
+    fi
+    http_code=$(curl -sk -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $tok" "$SERVER_URL/api/credits")
+    if [ "$http_code" = "401" ]; then
+        user_login_with_totp "User login (subscriptions session expired)"
+    fi
+}
+
+user_credits_json() {
+    curl -sk -H "Authorization: Bearer $(user_access_token)" "$SERVER_URL/api/credits"
+}
+
+mock_bridge_activate() {
+    local checkout_id="$1"
+    local username="$2"
+    curl -s -X POST "http://127.0.0.1:8081/v1/mock/activate" \
+        -H "Content-Type: application/json" \
+        -d "{\"checkout_id\":\"$checkout_id\",\"username\":\"$username\"}"
+}
+
+mock_bridge_expire() {
+    local subscription_ref="$1"
+    curl -s -X POST "http://127.0.0.1:8081/v1/mock/expire" \
+        -H "Content-Type: application/json" \
+        -d "{\"subscription_ref\":\"$subscription_ref\"}"
+}
+
+mock_bridge_replay() {
+    local subscription_ref="$1"
+    curl -s -X POST "http://127.0.0.1:8081/v1/mock/replay" \
+        -H "Content-Type: application/json" \
+        -d "{\"subscription_ref\":\"$subscription_ref\"}"
+}
+
+run_subscriptions() {
+    group "Subscriptions"
+
+    local e2e_script_dir go_bin mock_pid btcpay_mock_pid
+    local dev_plan_storage_bytes=268435456000
+    local user_token credits_json billing_mode effective_limit sub_source
+    local tx_count_before tx_count_after checkout_id checkout_out checkout_http
+    local invoice_http invoice_body topup_out topup_code bridge_sub_ref
+
+    e2e_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    go_bin="go"
+    if ! command -v go >/dev/null 2>&1; then
+        for path in "/usr/local/go/bin/go" "/usr/local/bin/go" "/usr/bin/go"; do
+            if [ -x "$path" ]; then
+                go_bin="$path"
+                break
+            fi
+        done
+    fi
+
+    export ARKFILE_SUBSCRIPTIONS_ENABLED=true
+    export ARKFILE_SUBSCRIPTION_BRIDGE_ENABLED=true
+    export ARKFILE_BILLING_PAYG_ENABLED=true
+    export ARKFILE_SUBSCRIPTION_BRIDGE_URL="http://127.0.0.1:8081"
+    export ARKFILE_SUBSCRIPTION_BRIDGE_PAIRING_ROOT="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    export ADMIN_DEV_TEST_API_ENABLED=true
+
+    mock_pid=$(start_mock_subscription_bridge "$e2e_script_dir" "$go_bin") || {
+        record_test "Start mock Subscription Bridge" "FAIL"
+        return 0
+    }
+    record_test "Start mock Subscription Bridge" "PASS"
+
+    scenario "Dev subscription plan exists"
+    local plans_out plans_code
+    safe_exec plans_out plans_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions list-plans --json
+    if [ $plans_code -eq 0 ] && echo "$plans_out" | grep -q 'plan_dev_250gb'; then
+        record_test "Dev plan plan_dev_250gb present" "PASS"
+    else
+        record_test "Dev plan plan_dev_250gb present" "FAIL"
+    fi
+
+    scenario "Grant gift subscription"
+    safe_exec gift_out gift_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions grant-gift-subscription --user "$TEST_USERNAME" --plan-id plan_dev_250gb --days 30 --note "e2e gift"
+    if [ $gift_code -eq 0 ]; then
+        record_test "Grant gift subscription" "PASS"
+    else
+        error "Gift grant failed: $gift_out"
+        record_test "Grant gift subscription" "FAIL"
+    fi
+
+    # Reuse the user session left by run_payments when still valid.
+    ensure_user_session
+
+    scenario "Credits API subscribed after gift grant"
+    credits_json=$(user_credits_json)
+    billing_mode=$(echo "$credits_json" | jq -r '.billing_mode // empty' 2>/dev/null)
+    sub_source=$(echo "$credits_json" | jq -r '.subscription.source // empty' 2>/dev/null)
+    effective_limit=$(echo "$credits_json" | jq -r '.subscription.effective_storage_limit_bytes // 0' 2>/dev/null)
+    if [ "$billing_mode" = "subscribed" ] && [ "$sub_source" = "gift" ] \
+        && [ "$effective_limit" = "$dev_plan_storage_bytes" ]; then
+        record_test "Credits API subscribed after gift grant" "PASS"
+    else
+        error "Unexpected credits after gift grant: $credits_json"
+        record_test "Credits API subscribed after gift grant" "FAIL"
+    fi
+
+    scenario "Admin subscriptions show gift subscription"
+    local admin_sub_out admin_sub_code
+    safe_exec admin_sub_out admin_sub_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions show --user "$TEST_USERNAME" --json
+    if [ $admin_sub_code -eq 0 ] \
+        && echo "$admin_sub_out" | jq -e '.billing_mode == "subscribed" and .subscription.source == "gift"' >/dev/null 2>&1 \
+        && echo "$admin_sub_out" | jq -e ".effective_storage_limit_bytes == $dev_plan_storage_bytes" >/dev/null 2>&1; then
+        record_test "Admin subscriptions show gift subscription" "PASS"
+    else
+        error "Admin subscriptions show unexpected: $admin_sub_out"
+        record_test "Admin subscriptions show gift subscription" "FAIL"
+    fi
+
+    scenario "CLI billing show while subscribed"
+    local billing_show_out billing_show_code
+    safe_exec billing_show_out billing_show_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        billing show
+    if [ $billing_show_code -eq 0 ] && echo "$billing_show_out" | grep -qi "subscribed"; then
+        record_test "CLI billing show while subscribed" "PASS"
+    else
+        record_test "CLI billing show while subscribed" "FAIL"
+    fi
+
+    scenario "CLI subscription status while subscribed"
+    local sub_status_out sub_status_code
+    safe_exec sub_status_out sub_status_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        subscription status
+    if [ $sub_status_code -eq 0 ] \
+        && echo "$sub_status_out" | grep -qi "250 GB" \
+        && echo "$sub_status_out" | grep -qi "active"; then
+        record_test "CLI subscription status while subscribed" "PASS"
+    else
+        record_test "CLI subscription status while subscribed" "FAIL"
+    fi
+
+    scenario "CLI subscription plans while subscribed"
+    local sub_plans_out sub_plans_code
+    safe_exec sub_plans_out sub_plans_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        subscription plans
+    if [ $sub_plans_code -eq 0 ] && echo "$sub_plans_out" | grep -q 'plan_dev_250gb'; then
+        record_test "CLI subscription plans while subscribed" "PASS"
+    else
+        record_test "CLI subscription plans while subscribed" "FAIL"
+    fi
+
+    scenario "Invoice API rejects top-up while gift subscribed"
+    user_token=$(user_access_token)
+    invoice_body=$(curl -sk -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"amount_usd":"1.00"}' \
+        "$SERVER_URL/api/billing/invoice")
+    invoice_http=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"amount_usd":"1.00"}' \
+        "$SERVER_URL/api/billing/invoice")
+    if [ "$invoice_http" = "409" ] && echo "$invoice_body" | grep -qi "subscription"; then
+        record_test "Invoice API 409 while gift subscribed" "PASS"
+    else
+        error "Expected invoice 409 while gift subscribed (http=$invoice_http): $invoice_body"
+        record_test "Invoice API 409 while gift subscribed" "FAIL"
+    fi
+
+    scenario "CLI top-up rejected while gift subscribed"
+    safe_exec topup_out topup_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        billing top-up --amount 1.00
+    if [ $topup_code -ne 0 ] && echo "$topup_out" | grep -qi "subscription"; then
+        record_test "Top-up rejected while gift subscribed" "PASS"
+    else
+        record_test "Top-up rejected while gift subscribed" "FAIL"
+    fi
+
+    scenario "Billing tick does not add usage while gift subscribed"
+    local tx_before_out tx_before_code tick_sub_out tick_sub_code tx_after_out tx_after_code
+    safe_exec tx_before_out tx_before_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing show --user "$TEST_USERNAME" --json
+    tx_count_before=$(echo "$tx_before_out" | jq -r '.pagination.count // 0' 2>/dev/null)
+    safe_exec tick_sub_out tick_sub_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing tick-now --json
+    safe_exec tx_after_out tx_after_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        billing show --user "$TEST_USERNAME" --json
+    tx_count_after=$(echo "$tx_after_out" | jq -r '.pagination.count // 0' 2>/dev/null)
+    if [ $tx_before_code -eq 0 ] && [ $tx_after_code -eq 0 ] && [ $tick_sub_code -eq 0 ] \
+        && [ "$tx_count_before" = "$tx_count_after" ]; then
+        record_test "tick-now skips usage while gift subscribed" "PASS"
+    else
+        if [ $tx_before_code -ne 0 ]; then
+            error "billing show before gift tick failed:"
+            echo "$tx_before_out"
+        fi
+        if [ $tick_sub_code -ne 0 ]; then
+            error "tick-now failed while gift subscribed:"
+            echo "$tick_sub_out"
+        fi
+        if [ $tx_after_code -ne 0 ]; then
+            error "billing show after gift tick failed:"
+            echo "$tx_after_out"
+        fi
+        error "Usage tx count changed while subscribed: before=$tx_count_before after=$tx_count_after"
+        record_test "tick-now skips usage while gift subscribed" "FAIL"
+    fi
+
+    scenario "Cancel gift subscription"
+    safe_exec cancel_out cancel_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions cancel-gift-subscription --user "$TEST_USERNAME" --immediate
+    if [ $cancel_code -eq 0 ]; then
+        record_test "Cancel gift subscription" "PASS"
+    else
+        record_test "Cancel gift subscription" "FAIL"
+    fi
+
+    scenario "Credits API not subscribed after gift cancel"
+    credits_json=$(user_credits_json)
+    billing_mode=$(echo "$credits_json" | jq -r '.billing_mode // empty' 2>/dev/null)
+    if [ "$billing_mode" != "subscribed" ]; then
+        record_test "Credits API not subscribed after gift cancel" "PASS"
+    else
+        error "Still subscribed after gift cancel: $credits_json"
+        record_test "Credits API not subscribed after gift cancel" "FAIL"
+    fi
+
+    scenario "Start mock BTCPay for post-cancel top-up checks"
+    btcpay_mock_pid=$(start_mock_btcpay_server "$e2e_script_dir" "$go_bin") || {
+        record_test "Start mock BTCPay for subscription top-up checks" "FAIL"
+        btcpay_mock_pid=""
+    }
+    if [ -n "$btcpay_mock_pid" ]; then
+        record_test "Start mock BTCPay for subscription top-up checks" "PASS"
+    fi
+
+    scenario "Invoice API allowed after gift cancel"
+    user_token=$(user_access_token)
+    local post_cancel_invoice_raw post_cancel_invoice_out post_cancel_invoice_http post_cancel_invoice_id
+    post_cancel_invoice_raw=$(curl -sk -w '\n%{http_code}' -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"amount_usd":"1.00"}' \
+        "$SERVER_URL/api/billing/invoice")
+    post_cancel_invoice_http=$(echo "$post_cancel_invoice_raw" | tail -n1)
+    post_cancel_invoice_out=$(echo "$post_cancel_invoice_raw" | sed '$d')
+    post_cancel_invoice_id=$(echo "$post_cancel_invoice_out" | jq -r '.data.invoice_id // empty' 2>/dev/null)
+    if [ "$post_cancel_invoice_http" = "200" ] && [ -n "$post_cancel_invoice_id" ]; then
+        record_test "Invoice API allowed after gift cancel" "PASS"
+        info "Post-cancel invoice id: $post_cancel_invoice_id"
+    else
+        error "Expected invoice API HTTP 200 after gift cancel (http=$post_cancel_invoice_http): $post_cancel_invoice_out"
+        record_test "Invoice API allowed after gift cancel" "FAIL"
+    fi
+
+    scenario "CLI top-up allowed after gift cancel"
+    safe_exec topup_out topup_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        billing top-up --amount 1.00
+    if [ $topup_code -eq 0 ]; then
+        record_test "CLI top-up allowed after gift cancel" "PASS"
+    else
+        error "CLI top-up failed after gift cancel (expected exit 0): $topup_out"
+        record_test "CLI top-up allowed after gift cancel" "FAIL"
+    fi
+
+    scenario "Subscription checkout returns checkout id"
+    user_token=$(user_access_token)
+    checkout_out=$(curl -sk -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"plan_id":"plan_dev_250gb"}' \
+        "$SERVER_URL/api/subscriptions/checkout")
+    checkout_http=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"plan_id":"plan_dev_250gb"}' \
+        "$SERVER_URL/api/subscriptions/checkout")
+    checkout_id=$(echo "$checkout_out" | jq -r '.data.checkout_id // empty' 2>/dev/null)
+    if [ "$checkout_http" = "200" ] && [ -n "$checkout_id" ]; then
+        record_test "Subscription checkout returns checkout id" "PASS"
+        info "Bridge checkout id: $checkout_id"
+    else
+        error "Checkout failed (http=$checkout_http): $checkout_out"
+        record_test "Subscription checkout returns checkout id" "FAIL"
+        checkout_id=""
+    fi
+
+    scenario "Bridge activate webhook subscribes user"
+    local activate_out activate_code
+    if [ -n "$checkout_id" ]; then
+        activate_out=$(mock_bridge_activate "$checkout_id" "$TEST_USERNAME")
+        bridge_sub_ref=$(echo "$activate_out" | jq -r '.subscription_ref // empty' 2>/dev/null)
+        if [ -n "$bridge_sub_ref" ] && echo "$activate_out" | jq -e '.status == "delivered"' >/dev/null 2>&1; then
+            credits_json=$(user_credits_json)
+            billing_mode=$(echo "$credits_json" | jq -r '.billing_mode // empty' 2>/dev/null)
+            sub_source=$(echo "$credits_json" | jq -r '.subscription.source // empty' 2>/dev/null)
+            effective_limit=$(echo "$credits_json" | jq -r '.subscription.effective_storage_limit_bytes // 0' 2>/dev/null)
+            if [ "$billing_mode" = "subscribed" ] && [ "$sub_source" = "bridge" ] \
+                && [ "$effective_limit" = "$dev_plan_storage_bytes" ]; then
+                record_test "Bridge activate webhook subscribes user" "PASS"
+            else
+                error "Credits after bridge activate: $credits_json"
+                record_test "Bridge activate webhook subscribes user" "FAIL"
+            fi
+        else
+            error "Mock bridge activate failed: $activate_out"
+            record_test "Bridge activate webhook subscribes user" "FAIL"
+        fi
+    else
+        record_test "Bridge activate webhook subscribes user" "FAIL"
+    fi
+
+    scenario "CLI subscription status after bridge activate"
+    safe_exec sub_status_out sub_status_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        subscription status
+    if [ $sub_status_code -eq 0 ] \
+        && echo "$sub_status_out" | grep -qi "250 GB" \
+        && echo "$sub_status_out" | grep -qi "active"; then
+        record_test "CLI subscription status after bridge activate" "PASS"
+    else
+        record_test "CLI subscription status after bridge activate" "FAIL"
+    fi
+
+    scenario "Grant gift rejected with bridge subscription"
+    safe_exec gift_dup_out gift_dup_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions grant-gift-subscription --user "$TEST_USERNAME" --plan-id plan_dev_250gb --days 30 --note "e2e duplicate gift"
+    if [ $gift_dup_code -ne 0 ] && echo "$gift_dup_out" | grep -Eiq "active|subscription|already"; then
+        record_test "Grant gift rejected with bridge subscription" "PASS"
+    else
+        error "Expected grant gift rejection with bridge sub: $gift_dup_out"
+        record_test "Grant gift rejected with bridge subscription" "FAIL"
+    fi
+
+    scenario "Cancel gift rejected for bridge subscription"
+    safe_exec cancel_bridge_out cancel_bridge_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        subscriptions cancel-gift-subscription --user "$TEST_USERNAME" --immediate
+    if [ $cancel_bridge_code -ne 0 ] && echo "$cancel_bridge_out" | grep -Eiq "paid|portal|processor|bridge"; then
+        record_test "Cancel gift rejected for bridge subscription" "PASS"
+    else
+        error "Expected cancel-gift rejection for bridge sub: $cancel_bridge_out"
+        record_test "Cancel gift rejected for bridge subscription" "FAIL"
+    fi
+
+    scenario "Invoice API rejects top-up while bridge subscribed"
+    user_token=$(user_access_token)
+    invoice_http=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"amount_usd":"1.00"}' \
+        "$SERVER_URL/api/billing/invoice")
+    if [ "$invoice_http" = "409" ]; then
+        record_test "Invoice API 409 while bridge subscribed" "PASS"
+    else
+        record_test "Invoice API 409 while bridge subscribed" "FAIL"
+    fi
+
+    scenario "CLI top-up rejected while bridge subscribed"
+    safe_exec topup_out topup_code \
+        $CLIENT --server-url "$SERVER_URL" --tls-insecure \
+        billing top-up --amount 1.00
+    if [ $topup_code -ne 0 ] && echo "$topup_out" | grep -qi "subscription"; then
+        record_test "Top-up rejected while bridge subscribed" "PASS"
+    else
+        record_test "Top-up rejected while bridge subscribed" "FAIL"
+    fi
+
+    scenario "Duplicate subscription bridge webhook is idempotent"
+    local dup_wh1 dup_wh2 admin_sub_before admin_sub_after
+    if [ -n "$bridge_sub_ref" ]; then
+        safe_exec admin_sub_before admin_sub_before_code \
+            $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+            subscriptions show --user "$TEST_USERNAME" --json
+        dup_wh1=$(mock_bridge_replay "$bridge_sub_ref")
+        dup_wh2=$(mock_bridge_replay "$bridge_sub_ref")
+        safe_exec admin_sub_after admin_sub_after_code \
+            $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+            subscriptions show --user "$TEST_USERNAME" --json
+        if [ $admin_sub_before_code -eq 0 ] && [ $admin_sub_after_code -eq 0 ] \
+            && echo "$dup_wh1" | jq -e '.success == true' >/dev/null 2>&1 \
+            && echo "$dup_wh2" | jq -e '.success == true' >/dev/null 2>&1 \
+            && [ "$admin_sub_before" = "$admin_sub_after" ]; then
+            record_test "Duplicate subscription bridge webhook idempotent" "PASS"
+        else
+            error "Duplicate webhook unexpected: wh1=$dup_wh1 wh2=$dup_wh2"
+            record_test "Duplicate subscription bridge webhook idempotent" "FAIL"
+        fi
+    else
+        record_test "Duplicate subscription bridge webhook idempotent" "FAIL"
+    fi
+
+    scenario "Bridge expire webhook ends subscription"
+    local expire_out
+    if [ -n "$bridge_sub_ref" ]; then
+        expire_out=$(mock_bridge_expire "$bridge_sub_ref")
+        credits_json=$(user_credits_json)
+        billing_mode=$(echo "$credits_json" | jq -r '.billing_mode // empty' 2>/dev/null)
+        if echo "$expire_out" | jq -e '.status == "expired"' >/dev/null 2>&1 && [ "$billing_mode" != "subscribed" ]; then
+            record_test "Bridge expire webhook ends subscription" "PASS"
+        else
+            error "Expire failed or still subscribed: expire=$expire_out credits=$credits_json"
+            record_test "Bridge expire webhook ends subscription" "FAIL"
+        fi
+    else
+        record_test "Bridge expire webhook ends subscription" "FAIL"
+    fi
+
+    scenario "Invoice API allowed after bridge expire"
+    user_token=$(user_access_token)
+    invoice_http=$(curl -sk -o /dev/null -w '%{http_code}' -X POST \
+        -H "Authorization: Bearer $user_token" \
+        -H "Content-Type: application/json" \
+        -d '{"amount_usd":"1.00"}' \
+        "$SERVER_URL/api/billing/invoice")
+    if [ "$invoice_http" != "409" ]; then
+        record_test "Invoice API allowed after bridge expire" "PASS"
+    else
+        record_test "Invoice API allowed after bridge expire" "FAIL"
+    fi
+
+    if [ -n "$btcpay_mock_pid" ]; then
+        info "Stopping mock BTCPay server..."
+        stop_mock_btcpay_server "$btcpay_mock_pid"
+    fi
+    stop_mock_subscription_bridge "$mock_pid"
+    info "Subscriptions complete"
+}
+
+run_registration_throttle() {
+    group "Registration throttle"
+
+    # Isolated, deterministic test of the positive registration throttle:
+    # 7 successful registrations per entityID are free; the 8th is rejected
+    # with HTTP 429 + Retry-After.  All registrations in the e2e run originate
+    # from the same host, so they share one entityID.
+    #
+    # We reset registration_attempts before (known state) and after (so the
+    # test host is not left in a multi-hour cooldown that would block manual
+    # testing).  The reset endpoint is dev/test-only.
+
+    scenario "Reset registration throttle (pre-test)"
+    local reset_out reset_code
+    safe_exec reset_out reset_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        reset-registration-throttle --json
+    if [ $reset_code -eq 0 ]; then
+        record_test "reset-registration-throttle (pre)" "PASS"
+    else
+        error "reset-registration-throttle (pre) failed (is ADMIN_DEV_TEST_API_ENABLED=true on the server?):"
+        echo "$reset_out"
+        record_test "reset-registration-throttle (pre)" "FAIL"
+    fi
+
+    scenario "Register 7 users (free allowance)"
+    local throttle_prefix="e2e-throttle-$$"
+    local i out code ok_count=0
+    for i in $(seq 1 7); do
+        safe_exec out code \
+            bash -c "printf '%s\n%s\n' '$TEST_PASSWORD' '$TEST_PASSWORD' | $CLIENT \
+                --server-url '$SERVER_URL' \
+                --tls-insecure \
+                register \
+                --username '${throttle_prefix}-${i}'"
+        if [ $code -eq 0 ] && echo "$out" | grep -q "Registration successful"; then
+            ok_count=$((ok_count + 1))
+        else
+            error "Registration #$i unexpectedly failed:"
+            echo "$out"
+        fi
+    done
+
+    if [ "$ok_count" -eq 7 ]; then
+        record_test "7 free registrations succeed" "PASS"
+    else
+        error "Only $ok_count/7 free registrations succeeded"
+        record_test "7 free registrations succeed" "FAIL"
+    fi
+
+    scenario "8th registration is throttled (429 + Retry-After)"
+    local eighth_out eighth_code
+    safe_exec eighth_out eighth_code \
+        bash -c "printf '%s\n%s\n' '$TEST_PASSWORD' '$TEST_PASSWORD' | $CLIENT \
+            --server-url '$SERVER_URL' \
+            --tls-insecure \
+            register \
+            --username '${throttle_prefix}-8'"
+
+    if [ $eighth_code -ne 0 ] \
+        && echo "$eighth_out" | grep -qi "HTTP 429" \
+        && echo "$eighth_out" | grep -qi "rate_limited"; then
+        record_test "8th registration blocked with 429 + Retry-After" "PASS"
+        info "Throttled response:"
+        echo "$eighth_out"
+    else
+        error "8th registration was not throttled as expected:"
+        echo "$eighth_out"
+        record_test "8th registration blocked with 429 + Retry-After" "FAIL"
+    fi
+
+    scenario "Reset registration throttle (cleanup)"
+    safe_exec reset_out reset_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        reset-registration-throttle --json
+    if [ $reset_code -eq 0 ]; then
+        record_test "reset-registration-throttle (cleanup)" "PASS"
+    else
+        error "reset-registration-throttle (cleanup) failed:"
+        echo "$reset_out"
+        record_test "reset-registration-throttle (cleanup)" "FAIL"
+    fi
+
+    success "Registration throttle complete"
+}
+
+run_enable_auto_approval() {
+    group "Enable auto-approval (post-test setup)"
+
+    # Required setup for subsequent Playwright registration and manual testing
+    # in the dev-reset environment: set require_approval=false so newly
+    # registered users are auto-approved. Failure fails the suite via
+    # record_test (same as other groups).
+    scenario "Set approval policy: require-approval=false (auto-approve on)"
+    local flip_out flip_code
+    safe_exec flip_out flip_code \
+        $ADMIN --server-url "$SERVER_URL" --tls-insecure \
+        set-approval-policy --require-approval false
+    if [ $flip_code -eq 0 ]; then
+        record_test "set-approval-policy --require-approval false" "PASS"
+        info "$flip_out"
+    else
+        error "set-approval-policy --require-approval false failed:"
+        echo "$flip_out"
+        record_test "set-approval-policy --require-approval false" "FAIL"
+    fi
+
+    success "Auto-approval enabled for Playwright and manual testing"
 }
 
 run_teardown() {
@@ -3360,6 +4438,9 @@ main() {
         run_storage_replication
         run_billing
         run_payments
+        run_subscriptions
+        run_registration_throttle
+        run_enable_auto_approval
         run_teardown
     )
 

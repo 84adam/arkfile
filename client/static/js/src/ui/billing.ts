@@ -24,6 +24,8 @@
  */
 
 import { authenticatedFetch, refreshToken, isAuthenticated, validateToken } from '../utils/auth';
+import { formatBytes } from '../utils/format.js';
+import { closeNavInlinePanelsExcept } from './sections.js';
 
 /** Toggle the billing panel visibility, loading data on open. */
 export async function toggleBillingPanel(): Promise<void> {
@@ -33,22 +35,10 @@ export async function toggleBillingPanel(): Promise<void> {
   const isHidden = panel.classList.contains('hidden');
   panel.classList.toggle('hidden');
 
-  // Mutual exclusion with the other inline panels.
-  closeOtherPanels('billing-panel');
-
+  // Mutual exclusion with the other inline panels (incl. download integrity).
   if (isHidden) {
+    closeNavInlinePanelsExcept('billing-panel');
     await loadBilling();
-  }
-}
-
-/** Close any open sibling panel except `keep`. */
-function closeOtherPanels(keep: string): void {
-  for (const id of ['security-settings', 'contact-info-panel', 'billing-panel']) {
-    if (id === keep) continue;
-    const el = document.getElementById(id);
-    if (el && !el.classList.contains('hidden')) {
-      el.classList.add('hidden');
-    }
   }
 }
 
@@ -56,6 +46,7 @@ interface CurrentUsage {
   total_storage_bytes: number;
   free_baseline_bytes: number;
   billable_bytes: number;
+  effective_storage_limit_bytes?: number;
   rate_microcents_per_gib_per_hour: number;
   rate_human: string;
   current_cost_per_month_microcents: number;
@@ -91,10 +82,34 @@ interface CreditsResponse {
   username: string;
   balance_usd_microcents: number;
   formatted_balance: string;
-  current_usage?: CurrentUsage;
+  billing_mode?: string;
+  current_usage?: CurrentUsage & { effective_storage_limit_bytes?: number };
   credits_runway?: CreditsRunway;
   transactions?: Transaction[];
   payments?: PaymentsConfig;
+  subscription?: SubscriptionInfo;
+}
+
+interface SubscriptionInfo {
+  enabled: boolean;
+  status?: string;
+  plan_id?: string;
+  plan_name?: string;
+  price_usd?: string;
+  baseline_storage_bytes?: number;
+  plan_storage_bytes?: number;
+  effective_storage_limit_bytes?: number;
+  current_period_end?: string;
+  cancel_at_period_end?: boolean;
+  source?: string;
+}
+
+interface SubscriptionPlan {
+  plan_id: string;
+  name: string;
+  price_usd_cents: number;
+  storage_limit_bytes: number;
+  description?: string;
 }
 
 /** Fetch /api/credits and render the panel. */
@@ -125,16 +140,128 @@ export async function loadBilling(): Promise<void> {
 function renderBilling(host: HTMLElement, d: CreditsResponse): void {
   host.innerHTML = '';
 
-  host.appendChild(renderBalanceSection(d));
-  host.appendChild(renderUsageSection(d));
-
-  // Transaction history is only rendered when there's at least one row.
-  // The empty state is "no Transaction History section at all", not an
-  // empty section with a "No transactions yet" placeholder.
-  const txs = d.transactions || [];
-  if (txs.length > 0) {
-    host.appendChild(renderTransactionsSection(txs));
+  if (d.subscription?.enabled) {
+    host.appendChild(renderSubscriptionSection(d));
   }
+
+  const isSubscribed = d.billing_mode === 'subscribed';
+  if (!isSubscribed) {
+    host.appendChild(renderBalanceSection(d));
+    host.appendChild(renderUsageSection(d));
+    const txs = d.transactions || [];
+    if (txs.length > 0) {
+      host.appendChild(renderTransactionsSection(txs));
+    }
+  } else {
+    host.appendChild(renderSubscribedUsageSection(d));
+  }
+}
+
+function renderSubscriptionSection(d: CreditsResponse): HTMLElement {
+  const wrap = document.createElement('section');
+  wrap.className = 'billing-panel-section';
+  const h = document.createElement('h4');
+  h.textContent = 'Your Plan';
+  wrap.appendChild(h);
+
+  const sub = d.subscription;
+  if (sub?.status) {
+    const p = document.createElement('p');
+    p.textContent = `${sub.plan_name || sub.plan_id} (${sub.price_usd ? '$' + sub.price_usd + '/mo' : ''}) — ${sub.status}`;
+    wrap.appendChild(p);
+    if (sub.current_period_end) {
+      const renew = document.createElement('p');
+      renew.textContent = sub.cancel_at_period_end
+        ? `Active until ${formatDate(sub.current_period_end)} (canceling)`
+        : `Renews ${formatDate(sub.current_period_end)}`;
+      wrap.appendChild(renew);
+    }
+    if (sub.source === 'bridge') {
+      const manageBtn = document.createElement('button');
+      manageBtn.type = 'button';
+      manageBtn.className = 'btn';
+      manageBtn.textContent = 'Manage Plan';
+      manageBtn.onclick = () => void openSubscriptionPortal();
+      wrap.appendChild(manageBtn);
+    }
+  } else {
+    void loadAvailablePlans(wrap);
+  }
+  return wrap;
+}
+
+async function loadAvailablePlans(host: HTMLElement): Promise<void> {
+  const list = document.createElement('div');
+  list.className = 'billing-plans-list';
+  host.appendChild(list);
+  try {
+    const resp = await authenticatedFetch('/api/subscriptions/plans', { method: 'GET' });
+    if (!resp.ok) throw new Error(String(resp.status));
+    const body = await resp.json();
+    const plans = (body.plans || []) as SubscriptionPlan[];
+    if (plans.length === 0) {
+      list.textContent = 'No plans available.';
+      return;
+    }
+    for (const plan of plans) {
+      const card = document.createElement('div');
+      card.className = 'billing-plan-card';
+      card.innerHTML = `<strong>${escapeHtml(plan.name)}</strong> — $${(plan.price_usd_cents / 100).toFixed(2)}/mo — ${formatBytes(plan.storage_limit_bytes)}`;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn';
+      btn.textContent = 'Subscribe';
+      btn.onclick = () => void startSubscriptionCheckout(plan.plan_id);
+      card.appendChild(btn);
+      list.appendChild(card);
+    }
+  } catch (err) {
+    list.textContent = `Failed to load plans: ${String(err)}`;
+  }
+}
+
+async function startSubscriptionCheckout(planId: string): Promise<void> {
+  const resp = await authenticatedFetch('/api/subscriptions/checkout', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plan_id: planId }),
+  });
+  if (!resp.ok) {
+    alert('Could not start checkout.');
+    return;
+  }
+  const body = await resp.json();
+  const url = body.data?.checkout_url;
+  if (url) window.location.href = url;
+}
+
+async function openSubscriptionPortal(): Promise<void> {
+  const resp = await authenticatedFetch('/api/subscriptions/portal', { method: 'POST' });
+  if (!resp.ok) {
+    alert('Could not open billing portal.');
+    return;
+  }
+  const body = await resp.json();
+  const url = body.data?.portal_url;
+  if (url) window.location.href = url;
+}
+
+function renderSubscribedUsageSection(d: CreditsResponse): HTMLElement {
+  const wrap = document.createElement('section');
+  wrap.className = 'billing-panel-section';
+  const h = document.createElement('h4');
+  h.textContent = 'Storage';
+  wrap.appendChild(h);
+  const cu = d.current_usage;
+  const dl = document.createElement('dl');
+  dl.className = 'billing-usage-grid';
+  if (cu) {
+    appendKV(dl, 'Storage used', formatBytes(cu.total_storage_bytes));
+    appendKV(dl, 'Upload cap', formatBytes(cu.effective_storage_limit_bytes ?? cu.free_baseline_bytes));
+  }
+  appendKV(dl, 'PAYG balance (frozen)', d.formatted_balance);
+  wrap.appendChild(dl);
+  return wrap;
 }
 
 /** Section 1: balance + (when below baseline) the friendly note. */
@@ -163,8 +290,8 @@ function renderBalanceSection(d: CreditsResponse): HTMLElement {
     wrap.appendChild(note);
   }
 
-  // Top Up Balance Button
-  if (d.payments?.enabled) {
+  // Top Up Balance Button (PAYG only; hidden while subscribed)
+  if (d.payments?.enabled && d.billing_mode !== 'subscribed') {
     const btnContainer = document.createElement('div');
     btnContainer.style.marginTop = '1rem';
 
@@ -212,6 +339,12 @@ function renderUsageSection(d: CreditsResponse): HTMLElement {
   appendKV(dl, 'Storage used', formatBytes(cu.total_storage_bytes));
   appendKV(dl, 'Free baseline', formatBytes(cu.free_baseline_bytes));
   appendKV(dl, 'Billable usage', formatBytes(cu.billable_bytes));
+  if (typeof cu.effective_storage_limit_bytes === 'number' && cu.effective_storage_limit_bytes > 0) {
+    appendKV(dl, 'Upload cap', formatBytes(cu.effective_storage_limit_bytes));
+  }
+  if (cu.rate_human) {
+    appendKV(dl, 'Rate', cu.rate_human);
+  }
 
   if (cu.billable_bytes > 0) {
     appendKV(dl, 'Your projected cost', cu.current_cost_per_month_usd_approx + '/month');
@@ -223,6 +356,9 @@ function renderUsageSection(d: CreditsResponse): HTMLElement {
     const runway = d.credits_runway;
     if (runway && typeof runway.estimated_hours_remaining === 'number' && runway.estimated_hours_remaining > 0) {
       appendKV(dl, 'Estimated runway', formatHoursFriendly(runway.estimated_hours_remaining));
+      if (runway.estimated_runs_out_at_approx) {
+        appendKV(dl, 'Estimated run-out', runway.estimated_runs_out_at_approx);
+      }
     } else if (runway?.note && d.balance_usd_microcents < 0) {
       // Negative balance: show the server's note (e.g. "Charges continue
       // to accumulate.") inline as a runway value rather than a separate
@@ -306,18 +442,6 @@ function appendKV(dl: HTMLElement, k: string, v: string): void {
   dd.textContent = v;
   dl.appendChild(dt);
   dl.appendChild(dd);
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  const units = ['KiB', 'MiB', 'GiB', 'TiB'];
-  let v = n / 1024;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(2)} ${units[i]}`;
 }
 
 function formatHoursFriendly(hours: number): string {
@@ -416,7 +540,7 @@ export async function resumePendingBillingCheckout(): Promise<boolean> {
   const panel = document.getElementById('billing-panel');
   if (panel) {
     panel.classList.remove('hidden');
-    closeOtherPanels('billing-panel');
+    closeNavInlinePanelsExcept('billing-panel');
   }
 
   const content = document.getElementById('billing-panel-content');
@@ -447,8 +571,45 @@ export async function resumePendingBillingCheckout(): Promise<boolean> {
   return true;
 }
 
-export async function handleBillingCheckoutReturn(): Promise<boolean> {
-  return resumePendingBillingCheckout();
+/** Poll /api/subscriptions/me after returning from bridge checkout. */
+export async function resumePendingSubscriptionCheckout(): Promise<boolean> {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('subscription') !== 'return') {
+    return false;
+  }
+  if (!(await ensureSessionForBillingPoll())) {
+    return false;
+  }
+  const panel = document.getElementById('billing-panel');
+  if (panel) {
+    panel.classList.remove('hidden');
+    closeNavInlinePanelsExcept('billing-panel');
+  }
+  const content = document.getElementById('billing-panel-content');
+  if (content) {
+    content.innerHTML = '<p>Confirming subscription…</p>';
+  }
+  for (let i = 0; i < 30; i++) {
+    const resp = await authenticatedFetch('/api/subscriptions/me', { method: 'GET' });
+    if (resp.ok) {
+      const body = await resp.json();
+      const data = body.data || body;
+      const st = data?.subscription?.status;
+      if (st === 'active' || st === 'trialing') {
+        await loadBilling();
+        const { showSuccess } = await import('./messages');
+        showSuccess('Subscription active.');
+        const clean = new URL(window.location.href);
+        clean.searchParams.delete('subscription');
+        clean.searchParams.delete('checkout_id');
+        window.history.replaceState({}, '', clean.pathname + clean.search + clean.hash);
+        return true;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  await loadBilling();
+  return true;
 }
 
 type InvoicePollOutcome = 'paid' | 'pending' | 'expired' | 'failed';
@@ -640,6 +801,7 @@ function showTopUpModal(cfg: PaymentsConfig): void {
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
 
+  const paymentRequestID = crypto.randomUUID();
   form.onsubmit = async (e) => {
     e.preventDefault();
     errorEl.style.display = 'none';
@@ -653,7 +815,7 @@ function showTopUpModal(cfg: PaymentsConfig): void {
       const response = await authenticatedFetch('/api/billing/invoice', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ amount_usd: amountStr }),
+        body: JSON.stringify({ amount_usd: amountStr, request_id: paymentRequestID }),
       });
 
       if (!response.ok) {

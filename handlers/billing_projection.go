@@ -5,7 +5,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/arkfile/Arkfile/database"
+	"github.com/arkfile/Arkfile/billing"
+	"github.com/arkfile/Arkfile/config"
 	"github.com/arkfile/Arkfile/models"
 )
 
@@ -24,7 +25,7 @@ import (
 // identical so frontend/tests do not branch on enabled/disabled.
 func buildBillingProjection(db *sql.DB, username string, balanceMicrocents int64) (map[string]interface{}, map[string]interface{}) {
 	totalStorageBytes := getUserTotalStorageBytes(db, username)
-	freeBaseline := freeBaselineBytes()
+	freeBaseline := billing.EffectiveFreeBaseline(db, username)
 
 	billable := totalStorageBytes - freeBaseline
 	if billable < 0 {
@@ -41,8 +42,11 @@ func buildBillingProjection(db *sql.DB, username string, balanceMicrocents int64
 		"rate_human":                       formatRateHuman(customerPrice),
 	}
 
+	effectiveLimit, _ := billing.EffectiveStorageLimit(db, username)
+	currentUsage["effective_storage_limit_bytes"] = effectiveLimit
+
 	// Cost projection (per-month, assuming 30 days = 720 hours).
-	if billable > 0 && rateAvailable {
+	if billable > 0 && rateAvailable && billing.ShouldMeter(db, username) {
 		hourlyMicrocents := (billable * rateMicrocentsPerGiBPerHour) >> 30
 		monthlyMicrocents := hourlyMicrocents * 720
 		currentUsage["current_cost_per_month_microcents"] = monthlyMicrocents
@@ -58,8 +62,41 @@ func buildBillingProjection(db *sql.DB, username string, balanceMicrocents int64
 	}
 
 	// Runway projection.
-	creditsRunway := buildCreditsRunway(balanceMicrocents, billable, rateMicrocentsPerGiBPerHour, rateAvailable)
+	creditsRunway := buildCreditsRunway(balanceMicrocents, billable, rateMicrocentsPerGiBPerHour, rateAvailable && billing.ShouldMeter(db, username))
 	return currentUsage, creditsRunway
+}
+
+func buildSubscriptionProjection(db *sql.DB, username string) (map[string]interface{}, string) {
+	cfg, err := config.LoadConfig()
+	if err != nil || !cfg.Subscriptions.Enabled {
+		return nil, ""
+	}
+
+	mode := string(billing.EffectiveBillingMode(db, username))
+	sub, _ := billing.GetActiveSubscription(db, username)
+	user, uerr := models.GetUserByUsername(db, username)
+	baseline := int64(models.DefaultStorageLimit)
+	if uerr == nil {
+		baseline = user.StorageLimitBytes
+	}
+
+	block := map[string]interface{}{
+		"enabled": true,
+	}
+	if sub != nil {
+		effectiveLimit, _ := billing.EffectiveStorageLimit(db, username)
+		block["status"] = sub.Status
+		block["plan_id"] = sub.PlanID
+		block["plan_name"] = sub.PlanName
+		block["price_usd"] = models.FormatPlanPriceUSD(sub.PlanPriceUSDCents)
+		block["baseline_storage_bytes"] = baseline
+		block["plan_storage_bytes"] = sub.PlanStorageBytes
+		block["effective_storage_limit_bytes"] = effectiveLimit
+		block["current_period_end"] = sub.CurrentPeriodEnd.UTC().Format(time.RFC3339)
+		block["cancel_at_period_end"] = sub.CancelAtPeriodEnd
+		block["source"] = sub.Source
+	}
+	return block, mode
 }
 
 // buildCreditsRunway computes how long the user's positive balance will last
@@ -124,18 +161,14 @@ func getUserTotalStorageBytes(db *sql.DB, username string) int64 {
 }
 
 // freeBaselineBytes returns the per-instance ARKFILE_FREE_STORAGE_BYTES.
-// Defaults to 1181116006 (1.1 GiB) to match models.DefaultStorageLimit.
-//
-// This wrapper exists so Section D can swap in a typed config-driven version
-// without revisiting handler call sites.
+// Defaults to 1073741824 (1 GiB) to match models.DefaultStorageLimit.
+// The indirection keeps configuration wiring outside the handler package.
 func freeBaselineBytes() int64 {
 	return billingFreeBaselineBytes()
 }
 
-// resolveBillingRate is the seam between the handlers and the billing
-// package. Section D replaces this with a real call to billing.ResolveRate.
-// Until then the seam returns zeros (rateAvailable=false), which is exercised
-// by the projection-builder paths above.
+// resolveBillingRate is the configured seam between handlers and the billing
+// package.
 func resolveBillingRate(db *sql.DB) (rateMicrocentsPerGiBPerHour int64, customerPriceUSDPerTBPerMonth string, rateAvailable bool) {
 	return billingResolveRate(db)
 }
@@ -149,8 +182,7 @@ func formatRateHuman(price string) string {
 	return fmt.Sprintf("$%s/TiB/month", price)
 }
 
-// Default seams. Section D overrides these via the Set* functions below,
-// which main.go calls during startup.
+// Default seams are replaced through the Set* functions during startup.
 
 var (
 	// billingFreeBaselineBytes returns the configured free baseline bytes.
@@ -191,7 +223,7 @@ var (
 
 // defaultFreeBaselineBytes mirrors models.DefaultStorageLimit so the seam
 // resolves to a sensible value before main.go wires BillingConfig.
-const defaultFreeBaselineBytes int64 = 1181116006
+const defaultFreeBaselineBytes int64 = 1073741824
 
 // SetBillingProjectionSeams wires the projection helpers to the live billing
 // package. Called once from main.go during startup.
@@ -236,7 +268,3 @@ func SetProcessPaymentFunc(fn func(db *sql.DB, username string, amountUSDMicroce
 func SetSettlePaymentInvoiceFunc(fn func(db *sql.DB, invoice *models.PaymentInvoice, paymentType string) (*models.CreditTransaction, error)) {
 	SettlePaymentInvoiceFunc = fn
 }
-
-// silence the unused-import linter when database isn't yet used (it is
-// referenced through the *sql.DB parameter; this assertion documents intent).
-var _ = database.DB

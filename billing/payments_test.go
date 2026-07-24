@@ -23,7 +23,7 @@ func openPaymentsTestDB(t *testing.T) *sql.DB {
 			username TEXT UNIQUE NOT NULL,
 			username_folded TEXT UNIQUE NOT NULL,
 			total_storage_bytes BIGINT NOT NULL DEFAULT 0,
-			storage_limit_bytes BIGINT NOT NULL DEFAULT 1181116006,
+			storage_limit_bytes BIGINT NOT NULL DEFAULT 1073741824,
 			is_approved BOOLEAN NOT NULL DEFAULT 1,
 			is_admin BOOLEAN NOT NULL DEFAULT 0
 		);
@@ -41,7 +41,7 @@ func openPaymentsTestDB(t *testing.T) *sql.DB {
 			username TEXT NOT NULL,
 			amount_usd_microcents BIGINT NOT NULL,
 			balance_after_usd_microcents BIGINT NOT NULL,
-			transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'adjustment', 'payment')),
+			transaction_type TEXT NOT NULL CHECK (transaction_type IN ('usage', 'gift', 'payment')),
 			reason TEXT,
 			admin_username TEXT,
 			metadata TEXT,
